@@ -8,7 +8,7 @@ sudo apt update && sudo apt install cmake build-essential ffmpeg
 
 2. Create Anconda environment
 ```terminal
-conda env create -n crowdnav python=3.10
+conda create -n crowdnav python=3.10
 ```
 
 3. Install crowd_sim and crowd_nav into pip
