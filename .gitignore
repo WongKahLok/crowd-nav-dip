@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+
+# WSL/Windows artifacts
+*:Zone.Identifier
+
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+/Python-RVO2-main/
