@@ -373,6 +373,24 @@ class HybridEnv(Grid):
     def grid_to_world(self, i: int, j: int) -> tuple:
         return (i * self.resolution, j * self.resolution)
     
+    def is_far_enough(self, pos, forb_list, min_dist=1.0):
+        """Spawn-validity test: pos must be in free space and >= min_dist from every forbidden point.
+
+        Called by generate_dynamic_obstacles() but never defined, so that generator raised
+        AttributeError the moment it was used; this restores it.
+
+        Args:
+            pos (tuple): candidate (x, y) in world coordinates
+            forb_list (list): forbidden (x, y) world points, e.g. the robot's start and goal
+            min_dist (float): required clearance from each forbidden point
+        """
+        if self.world_to_grid(*pos) in self.obstacles:  # inside land (or its inflation margin)
+            return False
+        for forb in forb_list:
+            if math.dist(pos, (forb[0], forb[1])) < min_dist:
+                return False
+        return True
+
     def generate_dynamic_obstacles(self, n_obstacles, forb_list, min_dist=1.0):
         obstacles = []
         while len(obstacles) < n_obstacles:

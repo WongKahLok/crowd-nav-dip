@@ -12,6 +12,7 @@ from crowd_nav.utils.theta_star import HybridEnv, ThetaStar
 from crowd_nav.utils.theta_star import interpolate_path, get_local_goal
 from crowd_sim.envs.utils.robot import Robot
 from crowd_sim.envs.policy.orca import ORCA
+from crowd_sim.envs.utils.info import Timeout
 
 def main():
     parser = argparse.ArgumentParser('Parse configuration file')
@@ -44,7 +45,7 @@ def main():
                 model_weights = os.path.join(args.model_dir, 'rl_model.pth')
     else:
         env_config_file = args.env_config
-        policy_config_file = args.env_config
+        policy_config_file = args.policy_config  # was args.env_config: wrong config loaded when --model_dir is omitted
 
     if args.static_map is not None:
         if not os.path.exists(args.static_map):
@@ -104,15 +105,18 @@ def main():
     one_goal = get_local_goal(robot.get_full_state(), ob, path_dense, local_goal_dist, monitor_dist)
     robot.gx, robot.gy = one_goal[0], one_goal[1]
     cnt_idx, cnt_max = 0, 200
+    info = None  # outcome of the episode: set below, either by env.step() or the iteration cap
     while not math.dist((robot.px, robot.py), path_dense[-1])<robot.radius:
-        done = False
-        ob = env.light_reset(args.phase, args.test_case)
-        action = robot.act(ob)
-        ob, _, done, info = env.step(action)
+        ob = env.light_reset(args.phase, args.test_case)  # re-observe: dynamic humans + nearby static cells
+        action = robot.act(ob)  # SARL: score all 81 candidate actions, pick the best
+        ob, _, done, info = env.step(action)  # advance the world by one time_step; done=True on collision/timeout/reach-goal
+        if done:
+            break  # stop right away instead of continuing and overwriting info on the next tick
         one_goal = get_local_goal(robot.get_full_state(), ob, path_dense, local_goal_dist, monitor_dist)
-        robot.gx, robot.gy = one_goal[0], one_goal[1]
+        robot.gx, robot.gy = one_goal[0], one_goal[1]  # slide the local goal forward along the path
         cnt_idx += 1
         if cnt_idx>=cnt_max:
+            info = Timeout()  # ran out of control-loop iterations, distinct from env's own time_limit-based Timeout
             break
 
     if args.visualize:
