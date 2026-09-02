@@ -518,6 +518,7 @@ class CrowdSim_test(gym.Env):
         self.land_max_y = float('inf')
         self.human_paths = []       # land free route of each dynamic obstacle
         self.human_wp_idx = []      # way point each dynamic obstacle is steering to
+        self.human_wp_dir = []      # +1/-1, direction each obstacle is walking its route in
         self.human_wp_radius = 1.0  # distance at which a way point counts as reached
 
         logging.info('human number: {}'.format(self.human_num))
@@ -670,6 +671,7 @@ class CrowdSim_test(gym.Env):
         self.humans = []
         self.human_paths = []
         self.human_wp_idx = []
+        self.human_wp_dir = []
         for idx in range(len(obst_list)):
             obst = obst_list[idx]
             start, goal = (obst['px'], obst['py']), (obst['gx'], obst['gy'])
@@ -685,6 +687,7 @@ class CrowdSim_test(gym.Env):
                 path = path[::-1]   # way points must start at the obstacle
             self.human_paths.append(path)
             self.human_wp_idx.append(0)
+            self.human_wp_dir.append(1)
         self.update_human_goals()
         return self.humans
 
@@ -722,16 +725,24 @@ class CrowdSim_test(gym.Env):
     def update_human_goals(self):
         """
         Steer every dynamic obstacle at the next way point of its route instead of at
-        its final goal, so ORCA never asks it to cross a landmass.
+        its final goal, so ORCA never asks it to cross a landmass. Once an obstacle
+        reaches the end of its route it turns around and retraces it, so it keeps
+        moving for the whole episode instead of stopping once it arrives.
         """
         for i, human in enumerate(self.humans):
             path = self.human_paths[i] if i < len(self.human_paths) else None
-            if not path:
+            if not path or len(path) < 2:
                 continue
             idx = self.human_wp_idx[i]
-            while idx < len(path) - 1 and math.dist(human.get_position(), path[idx]) < self.human_wp_radius:
-                idx += 1
+            direction = self.human_wp_dir[i]
+            while math.dist(human.get_position(), path[idx]) < self.human_wp_radius:
+                next_idx = idx + direction
+                if next_idx < 0 or next_idx >= len(path):
+                    direction *= -1
+                    next_idx = idx + direction
+                idx = next_idx
             self.human_wp_idx[i] = idx
+            self.human_wp_dir[i] = direction
             human.gx, human.gy = path[idx][0], path[idx][1]
 
     def keep_action_on_water(self, human, action):

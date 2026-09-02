@@ -19,7 +19,9 @@ from crowd_sim.envs.utils.info import Timeout
 DYNAMIC_OBSTACLES = [{'px': 27, 'py': 29, 'gx': 37, 'gy': 9},
                      {'px': 10, 'py': 20, 'gx': 30, 'gy': 10},
                      {'px': 28, 'py': 46, 'gx': 28, 'gy': 20},
-                     {'px': 24.5, 'py': 43, 'gx': 27, 'gy': 20}]
+                     {'px': 24.5, 'py': 43, 'gx': 27, 'gy': 20},
+                     {'px': 15, 'py': 35, 'gx': 35, 'gy': 25},
+                     {'px': 40, 'py': 30, 'gx': 20, 'gy': 15}]
 
 
 def build_dynamic_obstacles(env, obstacle_list, robot_route, seed=None):
@@ -160,7 +162,7 @@ def main():
 
     one_goal = get_local_goal(robot.get_full_state(), ob, path_dense, local_goal_dist, monitor_dist)
     robot.gx, robot.gy = one_goal[0], one_goal[1]
-    cnt_idx, cnt_max = 0, 200
+    cnt_idx, cnt_max = 0, 2000
     info = None  # outcome of the episode: set below, either by env.step() or the iteration cap
     while not math.dist((robot.px, robot.py), path_dense[-1])<robot.radius:
         ob = env.light_reset(args.phase, args.test_case)  # re-observe: dynamic humans + nearby static cells
