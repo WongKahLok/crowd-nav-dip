@@ -1182,17 +1182,35 @@ class CrowdSim_test(gym.Env):
                                in self.states]
                 orientations = [orientation]
             else:
+                # Raw per-frame velocity direction jitters when ORCA makes small avoidance
+                # corrections (worse near the destination, where speed -> 0 and direction
+                # noise dominates). Low-pass filter the heading on the unit circle (to avoid
+                # +-pi wrap-around artifacts) and hold the last heading while nearly stopped.
+                heading_smoothing_alpha = 0.3
+                min_speed_for_heading = 0.05
                 orientations = []
                 for i in range(self.human_num + 1):
                     orientation = []
+                    smoothed_theta = None
                     for state in self.states:
                         if i == 0:
                             agent_state = state[0]
                         else:
                             agent_state = state[1][i - 1]
-                        theta = np.arctan2(agent_state.vy, agent_state.vx)
-                        orientation.append(((agent_state.px, agent_state.py), (agent_state.px + radius * np.cos(theta),
-                                             agent_state.py + radius * np.sin(theta))))
+                        speed = np.hypot(agent_state.vx, agent_state.vy)
+                        if speed > min_speed_for_heading:
+                            raw_theta = np.arctan2(agent_state.vy, agent_state.vx)
+                            if smoothed_theta is None:
+                                smoothed_theta = raw_theta
+                            else:
+                                blended = (1 - heading_smoothing_alpha) * np.array(
+                                    [np.cos(smoothed_theta), np.sin(smoothed_theta)]) + \
+                                    heading_smoothing_alpha * np.array([np.cos(raw_theta), np.sin(raw_theta)])
+                                smoothed_theta = np.arctan2(blended[1], blended[0])
+                        elif smoothed_theta is None:
+                            smoothed_theta = 0.0
+                        orientation.append(((agent_state.px, agent_state.py), (agent_state.px + radius * np.cos(smoothed_theta),
+                                             agent_state.py + radius * np.sin(smoothed_theta))))
                     orientations.append(orientation)
             arrows = [patches.FancyArrowPatch(*orientation[0], color=arrow_color, arrowstyle=arrow_style)
                       for orientation in orientations]
