@@ -399,12 +399,14 @@ class HybridEnv(Grid):
                     return True
         return False
 
-    def is_far_enough(self, pos, forb_list, min_dist=1.0) -> bool:
+    def is_far_enough(self, pos, forb_list, min_dist=1.0, clearance=1.0) -> bool:
         """
-        A candidate position is valid when it is free water and keeps `min_dist` away
-        from every already placed start/goal point.
+        A candidate position is valid when it keeps `clearance` from the land and
+        `min_dist` from every already placed start/goal point. The two are separate:
+        demanding as much room from the coast as from the other ships would rule out
+        every narrow channel.
         """
-        if self.is_on_land(pos, clearance=min_dist):
+        if self.is_on_land(pos, clearance=clearance):
             return False
         for item in forb_list:
             if isinstance(item, dict):
@@ -438,6 +440,53 @@ class HybridEnv(Grid):
         way_points[0] = tuple(start_pos)
         way_points[-1] = tuple(goal_pos)
         return way_points
+
+    def generate_crossing_obstacles(self, n_obstacles, route, forb_list=(), min_dist=3.0,
+                                    cross_dist=(6.0, 14.0), clearance=1.0, max_trials=400, rng=None):
+        """
+        Place dynamic obstacles that actually meet the ship: each one is anchored to a
+        point of `route` (the ship's global path) and crosses it, and its own way points
+        are planned around the land.
+
+        Parameters:
+            n_obstacles (int): how many obstacles to place
+            route (list): the ship's path in world coordinates, start first
+            forb_list (list): start/goal points to stay away from
+            min_dist (float): separation from those points
+            cross_dist (tuple): min/max distance at which an obstacle is spawned
+            clearance (float): room to keep from the coast
+            rng: numpy random state, for reproducible scenarios
+
+        Returns:
+            obstacles (list): dicts with px, py, gx, gy and the planned 'path'
+        """
+        rng = np.random if rng is None else rng
+        dense_route = interpolate_path(route, step_size=0.5) if len(route) > 1 else list(route)
+        obstacles, taken = [], list(forb_list)
+        for k in range(n_obstacles):
+            anchor = dense_route[int((k + 1) * len(dense_route) / (n_obstacles + 1))]
+            for _ in range(max_trials):
+                angle = rng.uniform(0, 2 * np.pi)
+                reach = rng.uniform(*cross_dist)
+                offset = (reach * np.cos(angle), reach * np.sin(angle))
+                # start and goal on opposite sides of the ship's path, so the obstacle
+                # crosses it instead of sailing off into an empty corner of the map
+                start = (anchor[0] + offset[0], anchor[1] + offset[1])
+                goal = (anchor[0] - offset[0], anchor[1] - offset[1])
+                if not self.is_far_enough(start, taken, min_dist, clearance) or \
+                        not self.is_far_enough(goal, taken, min_dist, clearance):
+                    continue
+                path = self.plan_world_path(start, goal)
+                if path is None:
+                    continue
+                obstacle = {'px': start[0], 'py': start[1],
+                            'gx': goal[0], 'gy': goal[1], 'path': path}
+                obstacles.append(obstacle)
+                taken.append(obstacle)
+                break
+            else:
+                print('No free water found for a dynamic obstacle around {}'.format(anchor))
+        return obstacles
 
     def generate_dynamic_obstacles(self, n_obstacles, forb_list, min_dist=1.0, max_trials=1000):
         """

@@ -1,6 +1,8 @@
 import logging
 import gym
 import math
+import os
+import shutil
 import matplotlib.lines as mlines
 import numpy as np
 import rvo2
@@ -11,6 +13,23 @@ from crowd_sim.envs.utils.action import ActionXY
 from crowd_sim.envs.utils.human import Human
 from crowd_sim.envs.utils.info import *
 from crowd_sim.envs.utils.utils import point_to_segment_dist
+
+def find_ffmpeg():
+    """
+    Locate an ffmpeg binary. PATH first, then the one shipped with imageio-ffmpeg,
+    then the usual system location. Hard coding /usr/bin/ffmpeg breaks on any machine
+    that keeps it somewhere else, a conda environment for instance.
+    """
+    ffmpeg = shutil.which('ffmpeg')
+    if ffmpeg is not None:
+        return ffmpeg
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    return '/usr/bin/ffmpeg' if os.path.exists('/usr/bin/ffmpeg') else None
+
 
 ############################################################
 # Define the sim environment for the train mode
@@ -1022,7 +1041,9 @@ class CrowdSim_test(gym.Env):
     def render(self, mode='human', output_file=None):
         from matplotlib import animation
         import matplotlib.pyplot as plt
-        plt.rcParams['animation.ffmpeg_path'] = '/usr/bin/ffmpeg'
+        ffmpeg = find_ffmpeg()
+        if ffmpeg is not None:
+            plt.rcParams['animation.ffmpeg_path'] = ffmpeg
 
         x_offset = 0.11
         y_offset = 0.11
@@ -1229,9 +1250,17 @@ class CrowdSim_test(gym.Env):
             anim.running = True
 
             if output_file is not None:
-                ffmpeg_writer = animation.writers['ffmpeg']
-                writer = ffmpeg_writer(fps=8, metadata=dict(artist='Me'), bitrate=1800)
+                if animation.writers.is_available('ffmpeg'):
+                    writer = animation.writers['ffmpeg'](fps=8, metadata=dict(artist='Me'), bitrate=1800)
+                else:
+                    # no ffmpeg on this machine, fall back to a gif so the run is not lost
+                    output_file = os.path.splitext(output_file)[0] + '.gif'
+                    logging.warning('ffmpeg not found, writing %s instead. Install it with '
+                                    '"conda install -c conda-forge ffmpeg" or "pip install imageio-ffmpeg"',
+                                    output_file)
+                    writer = animation.PillowWriter(fps=8)
                 anim.save(output_file, writer=writer)
+                logging.info('Video written to %s', output_file)
             else:
                 plt.show()
         else:

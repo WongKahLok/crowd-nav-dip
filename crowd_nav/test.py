@@ -21,30 +21,47 @@ DYNAMIC_OBSTACLES = [{'px': 27, 'py': 29, 'gx': 37, 'gy': 9},
                      {'px': 24.5, 'py': 43, 'gx': 27, 'gy': 20}]
 
 
-def build_dynamic_obstacles(env, obstacle_list):
+def build_dynamic_obstacles(env, obstacle_list, robot_route, seed=None):
     """
-    Validate the start/goal of every dynamic obstacle against the static map and attach
-    the Theta* route it has to follow. Without a route the obstacle would head straight
-    for its goal and sail over the land in between.
+    Prepare the dynamic obstacles for the map that is actually loaded.
+
+    The pairs of `obstacle_list` are a preferred scenario: each one is checked against
+    the static map and gets the Theta* route it has to follow, because an obstacle that
+    heads straight for its goal sails over whatever land lies in between. Pairs that do
+    not fit this map (they were picked for a different one) are replaced by obstacles
+    generated on free water that cross the ship's own path.
 
     :param env: HybridEnv holding the (inflated) static map
-    :param obstacle_list: start/goal pairs
-    :return: the pairs that are usable, each with an extra 'path' entry
+    :param obstacle_list: preferred start/goal pairs
+    :param robot_route: the ship's global path in world coordinates, start first
+    :param seed: makes the generated obstacles reproducible
+    :return: usable obstacles, each with an extra 'path' entry
     """
     prepared = []
     for idx, obstacle in enumerate(obstacle_list):
         start = (obstacle['px'], obstacle['py'])
         goal = (obstacle['gx'], obstacle['gy'])
         if env.is_on_land(start) or env.is_on_land(goal):
-            logging.warning('Dynamic obstacle %d dropped: %s -> %s is not on free water',
-                            idx, start, goal)
+            logging.warning('Dynamic obstacle %d does not fit this map: %s -> %s is not '
+                            'on free water, replacing it', idx, start, goal)
             continue
         path = env.plan_world_path(start, goal)
         if path is None:
-            logging.warning('Dynamic obstacle %d dropped: no route from %s to %s',
-                            idx, start, goal)
+            logging.warning('Dynamic obstacle %d does not fit this map: no route from %s '
+                            'to %s, replacing it', idx, start, goal)
             continue
         prepared.append(dict(obstacle, path=path))
+
+    missing = len(obstacle_list) - len(prepared)
+    if missing > 0:
+        logging.info('Generating %d dynamic obstacle(s) for this map', missing)
+        prepared += env.generate_crossing_obstacles(missing, robot_route, forb_list=prepared,
+                                                    rng=np.random.RandomState(seed))
+    if not prepared:
+        raise RuntimeError('No dynamic obstacle could be placed on this map. The policy '
+                           'needs at least one observed agent, check the static map and '
+                           'the start/goal of the ship.')
+    logging.info('%d dynamic obstacle(s) on the water', len(prepared))
     return prepared
 
 
@@ -104,6 +121,10 @@ def main():
     env_loaded_safety_dist.load_from_image(args.static_map)
     planner = ThetaStar(start=(40, 5), goal=(32, 42), env=env_loaded_safety_dist)
     cost, path, expand = planner.plan()
+    if not path:
+        logging.error('No route for the ship on %s, check its start and goal', args.static_map)
+        return
+    robot_route = env_loaded.grid_2_drl(path)[::-1]   # start first
     env_config = configparser.RawConfigParser()
     env_config.read(env_config_file)
     env = gym.make('CrowdSimTest-v0')
@@ -131,7 +152,8 @@ def main():
     policy.set_env(env)
     robot.print_info()
     local_goal_dist, monitor_dist = 1, 5
-    dym_obs_list = build_dynamic_obstacles(env_loaded_safety_dist, DYNAMIC_OBSTACLES)
+    dym_obs_list = build_dynamic_obstacles(env_loaded_safety_dist, DYNAMIC_OBSTACLES,
+                                           robot_route, seed=args.test_case or 0)
     ob = env.reset(args.phase, args.test_case, dym_obs_list)
     path_dense = interpolate_path(env.global_path)[1:]
     
