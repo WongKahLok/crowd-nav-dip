@@ -49,7 +49,9 @@ class ORCA(Policy):
         Here set them to be large enough so that all agents will be considered as neighbors.
         Time_horizon should be set that at least it's safe for one time step
 
-        In this work, obstacles are not considered. So the value of time_horizon_obst doesn't matter.
+        Static obstacles (the land of the map) are registered with set_static_obstacles()
+        and handed to RVO2 as real obstacles, so time_horizon_obst controls how early an
+        agent starts turning away from the coast.
 
         """
         super().__init__()
@@ -65,6 +67,7 @@ class ORCA(Policy):
         self.radius = 0.3
         self.max_speed = 1
         self.sim = None
+        self.static_obstacles = []
 
     def configure(self, config):
         # self.time_step = config.getfloat('orca', 'time_step')
@@ -78,6 +81,20 @@ class ORCA(Policy):
 
     def set_phase(self, phase):
         return
+
+    def set_static_obstacles(self, obstacle_polygons):
+        """
+        Register the land the agent has to sail around.
+
+        :param obstacle_polygons: list of polygons, each a list of (x, y) vertices in
+                                  counter clockwise order (RVO2 keeps the free space on
+                                  the left hand side of every obstacle edge).
+        """
+        self.static_obstacles = [[tuple(v) for v in polygon] for polygon in obstacle_polygons]
+        # the cached simulator does not contain the new obstacles any more
+        if self.sim is not None:
+            del self.sim
+            self.sim = None
 
     def predict(self, state):
         """
@@ -97,6 +114,11 @@ class ORCA(Policy):
             self.sim = None
         if self.sim is None:
             self.sim = rvo2.PyRVOSimulator(self.time_step, *params, self.radius, self.max_speed)
+            # static obstacles have to be registered before the first doStep()
+            for polygon in self.static_obstacles:
+                self.sim.addObstacle(polygon)
+            if self.static_obstacles:
+                self.sim.processObstacles()
             self.sim.addAgent(self_state.position, *params, self_state.radius + 0.01 + self.safety_space,
                               self_state.v_pref, self_state.velocity)
             for human_state in state.human_states:

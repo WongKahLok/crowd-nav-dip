@@ -1,15 +1,35 @@
 import logging
 import gym
 import math
+import os
+import shutil
 import matplotlib.lines as mlines
 import numpy as np
 import rvo2
 from PIL import Image
 from matplotlib import patches
 from numpy.linalg import norm
+from crowd_sim.envs.utils.action import ActionXY
 from crowd_sim.envs.utils.human import Human
 from crowd_sim.envs.utils.info import *
 from crowd_sim.envs.utils.utils import point_to_segment_dist
+
+def find_ffmpeg():
+    """
+    Locate an ffmpeg binary. PATH first, then the one shipped with imageio-ffmpeg,
+    then the usual system location. Hard coding /usr/bin/ffmpeg breaks on any machine
+    that keeps it somewhere else, a conda environment for instance.
+    """
+    ffmpeg = shutil.which('ffmpeg')
+    if ffmpeg is not None:
+        return ffmpeg
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    return '/usr/bin/ffmpeg' if os.path.exists('/usr/bin/ffmpeg') else None
+
 
 ############################################################
 # Define the sim environment for the train mode
@@ -490,6 +510,15 @@ class CrowdSim_test(gym.Env):
 
         self.colregs_cfg = args.colregs # config for colregs  
         self.humans_static = [] # config for human static as static obstacles
+        # land description used to keep every agent on the water
+        self.land_cells = set()     # occupied cells, (i, j) grid indices
+        self.land_res = 1.0         # size of one cell
+        self.land_polygons = []     # merged land rectangles, fed to ORCA as obstacles
+        self.land_max_x = float('inf')
+        self.land_max_y = float('inf')
+        self.human_paths = []       # land free route of each dynamic obstacle
+        self.human_wp_idx = []      # way point each dynamic obstacle is steering to
+        self.human_wp_radius = 1.0  # distance at which a way point counts as reached
 
         logging.info('human number: {}'.format(self.human_num))
         if self.randomize_attributes:
@@ -633,13 +662,92 @@ class CrowdSim_test(gym.Env):
         return human
     
     def generate_dynamic_humans(self, obst_list):
+        """
+        Build the dynamic obstacles (other ships). Every obstacle may carry a 'path'
+        with the land free route it has to follow; without one it sails straight at its
+        goal, which is only safe when that straight line stays on the water.
+        """
         self.humans = []
+        self.human_paths = []
+        self.human_wp_idx = []
         for idx in range(len(obst_list)):
+            obst = obst_list[idx]
+            start, goal = (obst['px'], obst['py']), (obst['gx'], obst['gy'])
+            for name, position in (('start', start), ('goal', goal)):
+                if self.is_on_land(position):
+                    logging.warning('Dynamic obstacle %d has its %s %s on land, it will '
+                                    'sail through the coast', idx, name, position)
             human = Human(self.config, 'humans')
-            human.set(obst_list[idx]['px'], obst_list[idx]['py'],
-                      obst_list[idx]['gx'], obst_list[idx]['gy'], 0, 0, 0)
+            human.set(start[0], start[1], goal[0], goal[1], 0, 0, 0)
             self.humans.append(human)
+            path = list(obst.get('path') or [])
+            if path and math.dist(path[0], start) > math.dist(path[-1], start):
+                path = path[::-1]   # way points must start at the obstacle
+            self.human_paths.append(path)
+            self.human_wp_idx.append(0)
+        self.update_human_goals()
         return self.humans
+
+    def is_on_land(self, position, clearance=0.0):
+        """
+        True when a world position sits on land, within `clearance` of it, or outside
+        the map. Without a static map loaded everything counts as water.
+        """
+        if not self.land_cells:
+            return False
+        if not (0 <= position[0] <= self.land_max_x and 0 <= position[1] <= self.land_max_y):
+            return True
+        res = self.land_res
+        i = int(math.floor(position[0] / res))
+        j = int(math.floor(position[1] / res))
+        n = int(math.ceil(clearance / res))
+        for di in range(-n, n + 1):
+            for dj in range(-n, n + 1):
+                ni, nj = i + di, j + dj
+                if (ni, nj) not in self.land_cells:
+                    continue
+                # exact distance from the position to that land cell
+                dx = max(ni * res - position[0], 0.0, position[0] - (ni + 1) * res)
+                dy = max(nj * res - position[1], 0.0, position[1] - (nj + 1) * res)
+                if math.hypot(dx, dy) <= clearance:
+                    return True
+        return False
+
+    def human_final_goal(self, i):
+        """Final goal of a dynamic obstacle, its gx/gy hold the current way point."""
+        if i < len(self.human_paths) and self.human_paths[i]:
+            return self.human_paths[i][-1]
+        return self.humans[i].get_goal_position()
+
+    def update_human_goals(self):
+        """
+        Steer every dynamic obstacle at the next way point of its route instead of at
+        its final goal, so ORCA never asks it to cross a landmass.
+        """
+        for i, human in enumerate(self.humans):
+            path = self.human_paths[i] if i < len(self.human_paths) else None
+            if not path:
+                continue
+            idx = self.human_wp_idx[i]
+            while idx < len(path) - 1 and math.dist(human.get_position(), path[idx]) < self.human_wp_radius:
+                idx += 1
+            self.human_wp_idx[i] = idx
+            human.gx, human.gy = path[idx][0], path[idx][1]
+
+    def keep_action_on_water(self, human, action):
+        """
+        Last line of defence: refuse a step that would put a dynamic obstacle on land.
+        The move is first tried along x and y separately so the ship slides along the
+        coast instead of stopping dead.
+        """
+        if not self.land_cells:
+            return action
+        margin = human.radius
+        for candidate in (action, ActionXY(action.vx, 0), ActionXY(0, action.vy)):
+            next_position = human.compute_position(candidate, self.time_step)
+            if not self.is_on_land(next_position, clearance=margin):
+                return candidate
+        return ActionXY(0, 0)
 
     def get_human_times(self):
         """
@@ -687,6 +795,46 @@ class CrowdSim_test(gym.Env):
         # generate static human according to static obstacles
         for obs in obstacle_list:
             self.humans_static.append(self.generate_static_human(obs['cx'], obs['cy'], obs['w']/2))
+
+        # keep an occupancy grid of the land so that every agent can be tested against it
+        self.land_cells = set()
+        if obstacle_list:
+            self.land_res = obstacle_list[0]['w']
+            self.human_wp_radius = self.land_res
+            for obs in obstacle_list:
+                i = int(round((obs['cx'] - obs['w'] / 2) / self.land_res))
+                j = int(round((obs['cy'] - obs['h'] / 2) / self.land_res))
+                self.land_cells.add((i, j))
+        self.land_max_x = (max(i for i, _ in self.land_cells) + 1) * self.land_res if self.land_cells else float('inf')
+        self.land_max_y = (max(j for _, j in self.land_cells) + 1) * self.land_res if self.land_cells else float('inf')
+        self.land_polygons = self.build_land_polygons()
+
+    def build_land_polygons(self):
+        """
+        Merge horizontally adjacent land cells into rectangles and return them as
+        counter clockwise polygons, the form RVO2 expects for static obstacles.
+        Merging keeps the number of obstacles (and the ORCA constraints) manageable.
+        """
+        res = self.land_res
+        polygons = []
+        rows = {}
+        for (i, j) in self.land_cells:
+            rows.setdefault(j, []).append(i)
+        for j, columns in rows.items():
+            columns.sort()
+            run_start = previous = columns[0]
+            for i in columns[1:] + [None]:
+                if i == previous + 1:
+                    previous = i
+                    continue
+                x0, x1 = run_start * res, (previous + 1) * res
+                y0, y1 = j * res, (j + 1) * res
+                # counter clockwise, so the water stays outside the polygon
+                polygons.append([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+                if i is None:
+                    break
+                run_start = previous = i
+        return polygons
 
     def set_init_para(self, init_para: dict):
         self.env_x_min = init_para['x_min']
@@ -758,6 +906,10 @@ class CrowdSim_test(gym.Env):
         for agent in [self.robot] + self.humans:
             agent.time_step = self.time_step
             agent.policy.time_step = self.time_step
+            # ORCA only avoids what it knows about: without this the dynamic
+            # obstacles sail straight over the land
+            if hasattr(agent.policy, 'set_static_obstacles'):
+                agent.policy.set_static_obstacles(self.land_polygons)
 
         self.states = list()
         if hasattr(self.robot.policy, 'action_values'):
@@ -781,13 +933,17 @@ class CrowdSim_test(gym.Env):
         Compute actions for all agents, detect collision, update environment and return (ob, reward, done, info)
 
         """
+        # steer every dynamic obstacle at the next way point of its land free route
+        self.update_human_goals()
+
         human_actions = []
         for human in self.humans:
             # observation for humans is always coordinates
             ob = [other_human.get_observable_state() for other_human in self.humans if other_human != human]
             if self.robot.visible:
                 ob += [self.robot.get_observable_state()]
-            human_actions.append(human.act(ob))
+            # the land itself is handed to the policy as static obstacles, see reset()
+            human_actions.append(self.keep_action_on_water(human, human.act(ob)))
 
         # collision detection
         dmin = float('inf')
@@ -864,8 +1020,9 @@ class CrowdSim_test(gym.Env):
                 self.humans[i].step(human_action)
             self.global_time += self.time_step
             for i, human in enumerate(self.humans):
-                # only record the first time the human reaches the goal
-                if self.human_times[i] == 0 and human.reached_destination():
+                # only record the first time the human reaches its final goal
+                if self.human_times[i] == 0 and \
+                        math.dist(human.get_position(), self.human_final_goal(i)) < human.radius:
                     self.human_times[i] = self.global_time
 
             # compute the observation
@@ -884,7 +1041,9 @@ class CrowdSim_test(gym.Env):
     def render(self, mode='human', output_file=None):
         from matplotlib import animation
         import matplotlib.pyplot as plt
-        plt.rcParams['animation.ffmpeg_path'] = '/usr/bin/ffmpeg'
+        ffmpeg = find_ffmpeg()
+        if ffmpeg is not None:
+            plt.rcParams['animation.ffmpeg_path'] = ffmpeg
 
         x_offset = 0.11
         y_offset = 0.11
@@ -1091,9 +1250,17 @@ class CrowdSim_test(gym.Env):
             anim.running = True
 
             if output_file is not None:
-                ffmpeg_writer = animation.writers['ffmpeg']
-                writer = ffmpeg_writer(fps=8, metadata=dict(artist='Me'), bitrate=1800)
+                if animation.writers.is_available('ffmpeg'):
+                    writer = animation.writers['ffmpeg'](fps=8, metadata=dict(artist='Me'), bitrate=1800)
+                else:
+                    # no ffmpeg on this machine, fall back to a gif so the run is not lost
+                    output_file = os.path.splitext(output_file)[0] + '.gif'
+                    logging.warning('ffmpeg not found, writing %s instead. Install it with '
+                                    '"conda install -c conda-forge ffmpeg" or "pip install imageio-ffmpeg"',
+                                    output_file)
+                    writer = animation.PillowWriter(fps=8)
                 anim.save(output_file, writer=writer)
+                logging.info('Video written to %s', output_file)
             else:
                 plt.show()
         else:

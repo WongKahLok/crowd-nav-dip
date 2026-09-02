@@ -368,51 +368,161 @@ class HybridEnv(Grid):
         return drl_path
 
     def world_to_grid(self, x: float, y: float) -> tuple:
-        return (int(round(x / self.resolution)), int(round(y / self.resolution)))
+        # cell (i, j) covers [i*res, (i+1)*res) x [j*res, (j+1)*res) and its centre is
+        # ((i+0.5)*res, (j+0.5)*res), see get_static_obstacles(). Rounding instead of
+        # flooring shifted every world position by one cell.
+        return (int(math.floor(x / self.resolution)), int(math.floor(y / self.resolution)))
 
     def grid_to_world(self, i: int, j: int) -> tuple:
-        return (i * self.resolution, j * self.resolution)
-    
-    def is_far_enough(self, pos, forb_list, min_dist=1.0):
-        """Spawn-validity test: pos must be in free space and >= min_dist from every forbidden point.
+        # centre of the cell, consistent with get_static_obstacles() and grid_2_drl()
+        return ((i + 0.5) * self.resolution, (j + 0.5) * self.resolution)
 
-        Called by generate_dynamic_obstacles() but never defined, so that generator raised
-        AttributeError the moment it was used; this restores it.
-
-        Args:
-            pos (tuple): candidate (x, y) in world coordinates
-            forb_list (list): forbidden (x, y) world points, e.g. the robot's start and goal
-            min_dist (float): required clearance from each forbidden point
+    def is_on_land(self, pos, clearance: float = 0.0) -> bool:
         """
-        if self.world_to_grid(*pos) in self.obstacles:  # inside land (or its inflation margin)
+        True when the world position lies on a land cell, within `clearance` of one,
+        or outside the map. Everything else is navigable water.
+        """
+        res = self.resolution
+        if not (0 <= pos[0] <= self.x_range * res and 0 <= pos[1] <= self.y_range * res):
+            return True
+        i, j = self.world_to_grid(pos[0], pos[1])
+        n = int(math.ceil(clearance / res))
+        for di in range(-n, n + 1):
+            for dj in range(-n, n + 1):
+                ni, nj = i + di, j + dj
+                if (ni, nj) not in self.obstacles:
+                    continue
+                # exact distance from the position to that land cell
+                dx = max(ni * res - pos[0], 0.0, pos[0] - (ni + 1) * res)
+                dy = max(nj * res - pos[1], 0.0, pos[1] - (nj + 1) * res)
+                if math.hypot(dx, dy) <= clearance:
+                    return True
+        return False
+
+    def is_far_enough(self, pos, forb_list, min_dist=1.0, clearance=1.0) -> bool:
+        """
+        A candidate position is valid when it keeps `clearance` from the land and
+        `min_dist` from every already placed start/goal point. The two are separate:
+        demanding as much room from the coast as from the other ships would rule out
+        every narrow channel.
+        """
+        if self.is_on_land(pos, clearance=clearance):
             return False
-        for forb in forb_list:
-            if math.dist(pos, (forb[0], forb[1])) < min_dist:
-                return False
+        for item in forb_list:
+            if isinstance(item, dict):
+                points = [(item['px'], item['py']), (item['gx'], item['gy'])]
+            else:
+                points = [(item[0], item[1])]
+            for point in points:
+                if np.linalg.norm(np.array(pos) - np.array(point)) < min_dist:
+                    return False
         return True
 
-    def generate_dynamic_obstacles(self, n_obstacles, forb_list, min_dist=1.0):
+    def plan_world_path(self, start_pos, goal_pos):
+        """
+        Plan a land free route between two world positions with Theta*.
+
+        Returns:
+            way_points (list): world coordinates, start first and goal last,
+                               or None when no route exists.
+        """
+        start = self.world_to_grid(*start_pos)
+        goal = self.world_to_grid(*goal_pos)
+        if start in self.obstacles or goal in self.obstacles:
+            return None
+        if start == goal:
+            return [tuple(start_pos), tuple(goal_pos)]
+        _, path, _ = ThetaStar(start=start, goal=goal, env=self).plan()
+        if not path:
+            return None
+        # extractPath() returns the way points from the goal back to the start
+        way_points = [self.grid_to_world(i, j) for (i, j) in path[::-1]]
+        way_points[0] = tuple(start_pos)
+        way_points[-1] = tuple(goal_pos)
+        return way_points
+
+    def generate_crossing_obstacles(self, n_obstacles, route, forb_list=(), min_dist=3.0,
+                                    cross_dist=(6.0, 14.0), clearance=1.0, max_trials=400, rng=None):
+        """
+        Place dynamic obstacles that actually meet the ship: each one is anchored to a
+        point of `route` (the ship's global path) and crosses it, and its own way points
+        are planned around the land.
+
+        Parameters:
+            n_obstacles (int): how many obstacles to place
+            route (list): the ship's path in world coordinates, start first
+            forb_list (list): start/goal points to stay away from
+            min_dist (float): separation from those points
+            cross_dist (tuple): min/max distance at which an obstacle is spawned
+            clearance (float): room to keep from the coast
+            rng: numpy random state, for reproducible scenarios
+
+        Returns:
+            obstacles (list): dicts with px, py, gx, gy and the planned 'path'
+        """
+        rng = np.random if rng is None else rng
+        dense_route = interpolate_path(route, step_size=0.5) if len(route) > 1 else list(route)
+        obstacles, taken = [], list(forb_list)
+        for k in range(n_obstacles):
+            anchor = dense_route[int((k + 1) * len(dense_route) / (n_obstacles + 1))]
+            for _ in range(max_trials):
+                angle = rng.uniform(0, 2 * np.pi)
+                reach = rng.uniform(*cross_dist)
+                offset = (reach * np.cos(angle), reach * np.sin(angle))
+                # start and goal on opposite sides of the ship's path, so the obstacle
+                # crosses it instead of sailing off into an empty corner of the map
+                start = (anchor[0] + offset[0], anchor[1] + offset[1])
+                goal = (anchor[0] - offset[0], anchor[1] - offset[1])
+                if not self.is_far_enough(start, taken, min_dist, clearance) or \
+                        not self.is_far_enough(goal, taken, min_dist, clearance):
+                    continue
+                path = self.plan_world_path(start, goal)
+                if path is None:
+                    continue
+                obstacle = {'px': start[0], 'py': start[1],
+                            'gx': goal[0], 'gy': goal[1], 'path': path}
+                obstacles.append(obstacle)
+                taken.append(obstacle)
+                break
+            else:
+                print('No free water found for a dynamic obstacle around {}'.format(anchor))
+        return obstacles
+
+    def generate_dynamic_obstacles(self, n_obstacles, forb_list, min_dist=1.0, max_trials=1000):
+        """
+        Sample start/goal pairs for the dynamic obstacles. Both end points are on free
+        water and a land free Theta* route between them is stored in 'path', so the
+        obstacles sail around the coast instead of straight through it.
+        """
         obstacles = []
-        while len(obstacles) < n_obstacles:
-            valid_start = False
-            while not valid_start:
-                start_pos = (np.random.uniform(self.x_min, self.x_max), np.random.uniform(self.y_min, self.y_max))
-                if self.is_far_enough(start_pos, forb_list, min_dist):
-                    valid_start = True
-            valid_goal = False
-            while not valid_goal:
-                goal_pos = (np.random.uniform(self.x_min, self.x_max), np.random.uniform(self.y_min, self.y_max))
-                if self.is_far_enough(goal_pos, forb_list, min_dist) and \
-                    np.linalg.norm(np.array(goal_pos) - np.array(start_pos)) > min_dist:
-                    valid_goal = True
-            
-            obstacles.append({
+        taken = list(forb_list)
+        trials = 0
+        while len(obstacles) < n_obstacles and trials < max_trials:
+            trials += 1
+            start_pos = (np.random.uniform(self.x_min, self.x_max), np.random.uniform(self.y_min, self.y_max))
+            if not self.is_far_enough(start_pos, taken, min_dist):
+                continue
+            goal_pos = (np.random.uniform(self.x_min, self.x_max), np.random.uniform(self.y_min, self.y_max))
+            if not self.is_far_enough(goal_pos, taken, min_dist) or \
+                    np.linalg.norm(np.array(goal_pos) - np.array(start_pos)) < 4 * min_dist:
+                continue
+            path = self.plan_world_path(start_pos, goal_pos)
+            if path is None:
+                continue
+
+            obstacle = {
                 'px': start_pos[0],
                 'py': start_pos[1],
                 'gx': goal_pos[0],
-                'gy': goal_pos[1]
-            })
-            
+                'gy': goal_pos[1],
+                'path': path,
+            }
+            obstacles.append(obstacle)
+            taken.append(obstacle)
+
+        if len(obstacles) < n_obstacles:
+            print('Only {}/{} dynamic obstacles could be placed on free water'.format(
+                len(obstacles), n_obstacles))
         return obstacles
     
 class AStar(GraphSearcher):
