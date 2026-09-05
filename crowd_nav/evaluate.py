@@ -1,30 +1,13 @@
-"""Batch evaluation harness for CrowdNav-DIP (TODO.md Phase 2).
+"""Batch evaluation of Theta* guidance and local avoidance (metrics version 2).
 
-Runs the same Theta* + rolling-local-goal + learned-policy loop that test.py runs, but over
-many randomised, seeded scenarios, writing one CSV row per episode instead of a video.
-
-test.py answers "does it work on this one hard-coded scenario?"; this answers "how often does
-it work, and how well?" -- which is what the report needs.
-
-Usage:
+Run from crowd_nav/ with the project on PYTHONPATH:
     python evaluate.py --policy sarl --model_dir data/output-trained \
-                       --static_map ../static_maps/land_shapes_sf_crop.png \
-                       --episodes 100 --densities 2,4,8 --out results.csv
+        --static_map ../static_maps/land_shapes_sf_crop.png --episodes 100 --densities 2,4,8
 
-The four baselines of TODO.md Phase 3 are flag combinations, all on identical seeds:
-    B1  ORCA alone, no global planner   --policy orca   --no_global_plan
-    B2  Theta* + pure pursuit           --policy linear
-    B3  Theta* + ORCA                   --policy orca
-    B4  Theta* + SARL (this system)     --policy sarl
-
-Caveats worth knowing when interpreting the numbers:
-  * Dynamic obstacles are ORCA-driven and only observe *each other* (crowd_sim.py:787), never
-    the static map, so they sail straight through land. They are traffic, not a land model.
-  * env.light_reset() zeroes global_time every tick, so the environment's own time_limit
-    Timeout can never fire; --max_steps is the only timeout, and it is ours.
-  * Collision attribution (static vs dynamic) compares post-step clearances, while step()
-    detects collisions with a swept pre-step check, so attribution is a close approximation.
-    
+Clearances use swept circles against moving circles and filled land rectangles.
+They include initial overlap and every executed motion segment. Danger fraction
+includes collision steps. Simulated time comes from the episode clock; max_steps
+sets its budget. Version 1 CSV metrics are not directly comparable to version 2.
 """
 import argparse
 import configparser
@@ -39,14 +22,15 @@ import torch
 
 from crowd_nav.policy.policy_factory import policy_factory
 from crowd_nav.utils.theta_star import HybridEnv, ThetaStar, get_local_goal, interpolate_path
-from crowd_sim.envs.utils.info import Collision, ReachGoal
+from crowd_sim.envs.utils.info import Collision, ReachGoal, Timeout
 from crowd_sim.envs.utils.robot import Robot
 
 GRID_X, GRID_Y, GRID_RES = 50, 50, 1  # same discretisation test.py uses
 
 CSV_FIELDS = ['map', 'seed', 'n_dynamic', 'outcome', 'steps', 'sim_time', 'travelled_dist',
               'planned_dist', 'detour_ratio', 'min_sep_dynamic', 'min_sep_static',
-              'danger_frac', 'plan_cost', 'start_x', 'start_y', 'goal_x', 'goal_y']
+              'danger_frac', 'plan_cost', 'start_x', 'start_y', 'goal_x', 'goal_y',
+              'requested_n_dynamic', 'collision_kind', 'metrics_version']
 
 
 def build_grids(map_path, safety_distance):
@@ -70,6 +54,8 @@ def sample_scenario(plan_grid, cells, n_dynamic, min_route_len, max_tries=200):
 
     Returns None if no valid scenario was found within max_tries.
     """
+    if not cells:
+        return None
     for _ in range(max_tries):
         start = cells[np.random.randint(len(cells))]
         goal = cells[np.random.randint(len(cells))]
@@ -85,79 +71,84 @@ def sample_scenario(plan_grid, cells, n_dynamic, min_route_len, max_tries=200):
     return None
 
 
-def min_clearance(robot, agents):
-    """Smallest surface-to-surface gap between the robot and any agent (inf if none)."""
-    gap = float('inf')
-    for agent in agents:
-        d = math.dist((robot.px, robot.py), (agent.px, agent.py)) - robot.radius - agent.radius
-        gap = min(gap, d)
-    return gap
-
-
 def run_episode(env, robot, sim_grid, scenario, cfg):
-    """One episode of the full stack. Returns a metrics dict (one CSV row)."""
+    """Run one episode; all safety metrics come from the executed transitions."""
+    if cfg.max_steps <= 0:
+        raise ValueError('max_steps must be positive')
+    env.time_limit = cfg.max_steps * env.time_step
     env.set_local_goal_list(sim_grid.grid_2_drl(scenario['path']))
     ob = env.reset('test', None, scenario['dyn'])
-    path_dense = interpolate_path(env.global_path)[1:]
-    planned = sum(math.dist(path_dense[i], path_dense[i + 1]) for i in range(len(path_dense) - 1))
+    full_path = env.global_path
+    path_dense = interpolate_path(full_path)[1:]
+    planned = sum(math.dist(a, b) for a, b in zip(full_path, full_path[1:]))
 
     if cfg.no_global_plan:
-        # B1: no global guidance -- aim straight at the final goal for the whole episode.
-        # The Theta* route is still planned, but only as the optimal-distance reference.
-        robot.gx, robot.gy = path_dense[-1][0], path_dense[-1][1]
+        robot.gx, robot.gy = full_path[-1]
     else:
-        one_goal = get_local_goal(robot.get_full_state(), ob, path_dense,
-                                  cfg.local_goal_dist, cfg.monitor_dist)
-        robot.gx, robot.gy = one_goal[0], one_goal[1]
+        robot.gx, robot.gy = get_local_goal(robot.get_full_state(), ob, path_dense,
+                                          cfg.local_goal_dist, cfg.monitor_dist)
 
+    nav = robot.get_full_state()
+    humans = [h.get_observable_state() for h in env.humans]
+    _, _, initial = env.assess_motion(nav, nav, humans, humans, end_time=env.global_time)
+    min_sep_dyn, min_sep_stat = initial.min_sep_dynamic, initial.min_sep_static
     travelled, danger_steps, steps = 0.0, 0, 0
-    min_sep_dyn, min_sep_stat = float('inf'), float('inf')
-    outcome = 'timeout'  # stays timeout unless something below overrides it
+    outcome, collision_kind = 'timeout', None
 
     for steps in range(1, cfg.max_steps + 1):
-        ob = env.light_reset('test', None)  # dynamic humans + static cells within nearby_dist
-        action = robot.act(ob)  # policy scores every candidate action, picks the best
-        prev = (robot.px, robot.py)
+        ob = env.light_reset('test', None)
+        action = robot.act(ob)
+        prev = robot.get_position()
         ob, _, done, info = env.step(action)
-        travelled += math.dist(prev, (robot.px, robot.py))
-
-        # get_humans_nearby() appends dynamic humans first, then nearby static cells
-        nearby = env.get_humans_nearby()
-        d_dyn = min_clearance(robot, nearby[:len(env.humans)])
-        d_stat = min_clearance(robot, nearby[len(env.humans):])
-        min_sep_dyn, min_sep_stat = min(min_sep_dyn, d_dyn), min(min_sep_stat, d_stat)
-        if min(d_dyn, d_stat) < env.discomfort_dist:
+        travelled += math.dist(prev, robot.get_position())
+        min_sep_dyn = min(min_sep_dyn, info.min_sep_dynamic)
+        min_sep_stat = min(min_sep_stat, info.min_sep_static)
+        if min(info.min_sep_dynamic, info.min_sep_static) < env.discomfort_dist:
             danger_steps += 1
 
-        if isinstance(info, Collision):
-            outcome = 'collision_dynamic' if d_dyn <= d_stat else 'collision_static'
+        if done:
+            if isinstance(info, Collision):
+                collision_kind = info.collision_kind
+                outcome = 'collision_' + collision_kind
+            elif isinstance(info, ReachGoal):
+                if math.dist(robot.get_position(), full_path[-1]) >= robot.radius:
+                    raise AssertionError('ReachGoal must refer to the final route goal')
+                outcome = 'success'
+            elif isinstance(info, Timeout):
+                outcome = 'timeout'
+            else:
+                raise ValueError('Unexpected terminal info: {}'.format(info))
             break
-        # ReachGoal can only fire at the true path end: get_local_goal never returns a point
-        # closer than local_goal_dist (1 m) unless the path has run out, and robot.radius < 1 m
-        if isinstance(info, ReachGoal) or \
-                math.dist((robot.px, robot.py), path_dense[-1]) < robot.radius:
-            outcome = 'success'
-            break
+        if not cfg.no_global_plan:
+            robot.gx, robot.gy = get_local_goal(robot.get_full_state(), ob, path_dense,
+                                              cfg.local_goal_dist, cfg.monitor_dist)
 
-        if not cfg.no_global_plan:  # B1 keeps aiming at the final goal, so nothing to slide
-            one_goal = get_local_goal(robot.get_full_state(), ob, path_dense,
-                                      cfg.local_goal_dist, cfg.monitor_dist)
-            robot.gx, robot.gy = one_goal[0], one_goal[1]  # slide the local goal forward each tick
-
+    if not math.isclose(env.global_time, steps * env.time_step, rel_tol=0, abs_tol=1e-8):
+        raise AssertionError('Episode time does not match executed steps')
     return {
         'outcome': outcome,
         'steps': steps,
-        'sim_time': round(steps * env.time_step, 2),
+        'sim_time': round(env.global_time, 6),
         'travelled_dist': round(travelled, 3),
         'planned_dist': round(planned, 3),
         'detour_ratio': round(travelled / planned, 3) if planned > 0 else '',
-        'min_sep_dynamic': round(min_sep_dyn, 3) if math.isfinite(min_sep_dyn) else '',
-        'min_sep_static': round(min_sep_stat, 3) if math.isfinite(min_sep_stat) else '',
-        'danger_frac': round(danger_steps / steps, 3) if steps else '',
+        'min_sep_dynamic': round(min_sep_dyn, 6) if math.isfinite(min_sep_dyn) else '',
+        'min_sep_static': round(min_sep_stat, 6) if math.isfinite(min_sep_stat) else '',
+        'danger_frac': round(danger_steps / steps, 6) if steps else '',
         'plan_cost': round(scenario['cost'], 3),
         'start_x': scenario['start'][0], 'start_y': scenario['start'][1],
         'goal_x': scenario['goal'][0], 'goal_y': scenario['goal'][1],
+        'n_dynamic': len(env.humans),
+        'collision_kind': collision_kind or '',
+        'metrics_version': 2,
     }
+
+
+def scenario_failed_row(map_name, seed, requested):
+    row = dict.fromkeys(CSV_FIELDS, '')
+    row.update(map=map_name, seed=seed, requested_n_dynamic=requested,
+               outcome='scenario_failed', metrics_version=2)
+    return row
 
 
 def build_policy(args, device):
@@ -204,11 +195,15 @@ def main():
     parser.add_argument('--safety_distance', type=int, default=1)
     parser.add_argument('--min_route_len', type=float, default=20.0)
     cfg = parser.parse_args()
+    if cfg.max_steps <= 0 or cfg.episodes <= 0:
+        parser.error('max_steps and episodes must be positive')
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s, %(levelname)s: %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S')
     device = torch.device('cuda:0' if torch.cuda.is_available() and cfg.gpu else 'cpu')
     densities = [int(d) for d in cfg.densities.split(',')]
+    if any(d < 0 for d in densities):
+        parser.error('densities must be non-negative')
 
     env_config = configparser.RawConfigParser()
     env_config.read(os.path.join(cfg.model_dir, os.path.basename(cfg.env_config))
@@ -225,7 +220,7 @@ def main():
             sim_grid, plan_grid = build_grids(map_path, cfg.safety_distance)
             cells = free_cells(plan_grid)
 
-            # one env per map: set_obstacles() appends, so it must not be called twice per map
+            # Each map gets its own environment and episode geometry.
             env = gym.make('CrowdSimTest-v0')
             env.configure(env_config, cfg)
             robot = Robot(env_config, 'robot')
@@ -241,41 +236,50 @@ def main():
                     np.random.seed(seed)  # scenario sampling is the only stochastic part
                     scenario = sample_scenario(plan_grid, cells, n_dyn, cfg.min_route_len)
                     if scenario is None:
-                        logging.warning('%s seed %d: no valid scenario found, skipping', map_name, seed)
-                        continue
-                    row = run_episode(env, robot, sim_grid, scenario, cfg)
-                    row.update({'map': map_name, 'seed': seed, 'n_dynamic': n_dyn})
+                        logging.warning('%s seed %d: no valid scenario found', map_name, seed)
+                        row = scenario_failed_row(map_name, seed, n_dyn)
+                    else:
+                        row = run_episode(env, robot, sim_grid, scenario, cfg)
+                        row.update(map=map_name, seed=seed, requested_n_dynamic=n_dyn)
+                        if row['n_dynamic'] != n_dyn:
+                            logging.warning('%s seed %d: placed %d of %d requested obstacles',
+                                            map_name, seed, row['n_dynamic'], n_dyn)
                     writer.writerow(row)
-                    fh.flush()  # keep partial results if a long run is interrupted
+                    fh.flush()
                     rows.append(row)
-                    logging.info('%s | n=%d | seed=%3d | %-17s | %3d steps | detour %s',
-                                 map_name, n_dyn, seed, row['outcome'], row['steps'],
-                                 row['detour_ratio'])
+                    logging.info('%s | requested=%d actual=%s | seed=%d | %s | steps=%s',
+                                 map_name, n_dyn, row['n_dynamic'], seed, row['outcome'], row['steps'])
 
     summarise(rows, cfg.out)
 
 
 def summarise(rows, out_path):
-    """Print success/collision/timeout rates per (map, density) -- the table for the report."""
+    """Separate generation failures from executed episodes and their collision rates."""
     if not rows:
-        logging.warning('No episodes completed.')
+        logging.warning('No scenarios attempted.')
         return
     groups = {}
+    failed = sum(r['outcome'] == 'scenario_failed' for r in rows)
+    short = sum(r['outcome'] != 'scenario_failed' and
+                r['n_dynamic'] < r['requested_n_dynamic'] for r in rows)
     for row in rows:
-        groups.setdefault((row['map'], row['n_dynamic']), []).append(row)
-
-    print('\n%-28s %5s %6s %8s %9s %8s %9s %8s' %
-          ('map', 'n', 'runs', 'success', 'coll_dyn', 'coll_st', 'timeout', 'detour'))
+        if row['outcome'] != 'scenario_failed':
+            groups.setdefault((row['map'], row['n_dynamic']), []).append(row)
+    print('Metrics v2 | attempted={} executed={} scenario_failed={} underfilled={}'.format(
+        len(rows), len(rows) - failed, failed, short))
+    print('map n runs success coll_dyn coll_static coll_both coll_total timeout detour')
     for (map_name, n_dyn), group in sorted(groups.items()):
         total = len(group)
-        rate = lambda name: sum(r['outcome'] == name for r in group) / total
+        def rate(name):
+            return sum(r['outcome'] == name for r in group) / total
+        coll = sum(r['outcome'].startswith('collision_') for r in group) / total
         detours = [r['detour_ratio'] for r in group
                    if r['outcome'] == 'success' and r['detour_ratio'] != '']
-        print('%-28s %5d %6d %8.2f %9.2f %8.2f %9.2f %8s' %
-              (map_name, n_dyn, total, rate('success'), rate('collision_dynamic'),
-               rate('collision_static'), rate('timeout'),
-               '%.3f' % (sum(detours) / len(detours)) if detours else '-'))
-    print('\nPer-episode rows written to %s' % out_path)
+        print('{} {} {} {:.3f} {:.3f} {:.3f} {:.3f} {:.3f} {:.3f} {}'.format(
+            map_name, n_dyn, total, rate('success'), rate('collision_dynamic'),
+            rate('collision_static'), rate('collision_both'), coll, rate('timeout'),
+            '{:.3f}'.format(sum(detours) / len(detours)) if detours else '-'))
+    print('Per-episode rows written to {}'.format(out_path))
 
 
 if __name__ == '__main__':

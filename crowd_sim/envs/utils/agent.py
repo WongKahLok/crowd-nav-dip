@@ -58,7 +58,8 @@ class Agent(object):
             self.v_pref = v_pref
 
     def get_observable_state(self):
-        return ObservableState(self.px, self.py, self.vx, self.vy, self.radius)
+        return ObservableState(self.px, self.py, self.vx, self.vy, self.radius,
+                               is_static=getattr(self, 'is_static', False))
 
     def get_next_observable_state(self, action):
         self.check_validity(action)
@@ -71,7 +72,8 @@ class Agent(object):
             next_theta = self.theta + action.r
             next_vx = action.v * np.cos(next_theta)
             next_vy = action.v * np.sin(next_theta)
-        return ObservableState(next_px, next_py, next_vx, next_vy, self.radius)
+        return ObservableState(next_px, next_py, next_vx, next_vy, self.radius,
+                               is_static=getattr(self, 'is_static', False))
 
     def get_full_state(self):
         return FullState(self.px, self.py, self.vx, self.vy, self.radius, self.gx, self.gy, self.v_pref, self.theta)

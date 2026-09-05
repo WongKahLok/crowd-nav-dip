@@ -12,7 +12,7 @@ from crowd_nav.utils.theta_star import HybridEnv, ThetaStar
 from crowd_nav.utils.theta_star import interpolate_path, get_local_goal
 from crowd_sim.envs.utils.robot import Robot
 from crowd_sim.envs.policy.orca import ORCA
-from crowd_sim.envs.utils.info import Timeout
+from crowd_sim.envs.utils.info import ReachGoal, Timeout
 
 # start/goal of the other ships, in world coordinates. Every pair is checked against the
 # static map and gets a land free route before it is handed to the simulator.
@@ -85,7 +85,10 @@ def main():
     parser.add_argument('--traj', default=False, action='store_true')
     parser.add_argument('--colregs', default=False, action='store_true')
     parser.add_argument('--static_map', type=str, default=None)
+    parser.add_argument('--max_steps', type=int, default=2000)
     args = parser.parse_args()
+    if args.max_steps <= 0:
+        parser.error('max_steps must be positive')
 
     if args.model_dir is not None:
         env_config_file = os.path.join(args.model_dir, os.path.basename(args.env_config))
@@ -117,7 +120,7 @@ def main():
     if policy.trainable:
         if args.model_dir is None:
             parser.error('Trainable policy must be specified with a model weights directory')
-        policy.get_model().load_state_dict(torch.load(model_weights))
+        policy.get_model().load_state_dict(torch.load(model_weights, map_location=device))
     env_loaded = HybridEnv(x_range=50, y_range=50, resolution=1, safety_distance=0)
     env_loaded.load_from_image(args.static_map)
     env_loaded_safety_dist = HybridEnv(x_range=50, y_range=50, resolution=1, safety_distance=1)
@@ -132,6 +135,7 @@ def main():
     env_config.read(env_config_file)
     env = gym.make('CrowdSimTest-v0')
     env.configure(env_config, args)
+    env.time_limit = args.max_steps * env.time_step
     if args.square:
         env.test_sim = 'square_crossing'
     if args.circle:
@@ -162,20 +166,17 @@ def main():
 
     one_goal = get_local_goal(robot.get_full_state(), ob, path_dense, local_goal_dist, monitor_dist)
     robot.gx, robot.gy = one_goal[0], one_goal[1]
-    cnt_idx, cnt_max = 0, 2000
-    info = None  # outcome of the episode: set below, either by env.step() or the iteration cap
-    while not math.dist((robot.px, robot.py), path_dense[-1])<robot.radius:
-        ob = env.light_reset(args.phase, args.test_case)  # re-observe: dynamic humans + nearby static cells
-        action = robot.act(ob)  # SARL: score all 81 candidate actions, pick the best
-        ob, _, done, info = env.step(action)  # advance the world by one time_step; done=True on collision/timeout/reach-goal
+    info = None
+    for _ in range(args.max_steps):
+        ob = env.light_reset(args.phase, args.test_case)
+        action = robot.act(ob)
+        ob, _, done, info = env.step(action)
         if done:
-            break  # stop right away instead of continuing and overwriting info on the next tick
-        one_goal = get_local_goal(robot.get_full_state(), ob, path_dense, local_goal_dist, monitor_dist)
-        robot.gx, robot.gy = one_goal[0], one_goal[1]  # slide the local goal forward along the path
-        cnt_idx += 1
-        if cnt_idx>=cnt_max:
-            info = Timeout()  # ran out of control-loop iterations, distinct from env's own time_limit-based Timeout
             break
+        one_goal = get_local_goal(robot.get_full_state(), ob, path_dense, local_goal_dist, monitor_dist)
+        robot.gx, robot.gy = one_goal[0], one_goal[1]
+    else:
+        info = Timeout()
 
     if args.visualize:
         if args.traj:
@@ -184,7 +185,7 @@ def main():
             env.render('video', args.video_file)
 
         logging.info('It takes %.2f seconds to finish. Final status is %s', env.global_time, info)
-        if robot.visible and info == 'reach goal':
+        if robot.visible and isinstance(info, ReachGoal):
             human_times = env.get_human_times()
             logging.info('Average time for humans to reach goal: %.2f', sum(human_times) / len(human_times))
     else:

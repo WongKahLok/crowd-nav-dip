@@ -12,7 +12,8 @@ from numpy.linalg import norm
 from crowd_sim.envs.utils.action import ActionXY
 from crowd_sim.envs.utils.human import Human
 from crowd_sim.envs.utils.info import *
-from crowd_sim.envs.utils.utils import point_to_segment_dist
+from crowd_sim.envs.utils.collision import static_clearance
+from crowd_sim.envs.utils.transition import TransitionMixin
 
 def find_ffmpeg():
     """
@@ -34,7 +35,7 @@ def find_ffmpeg():
 ############################################################
 # Define the sim environment for the train mode
 ############################################################
-class CrowdSim_train(gym.Env):
+class CrowdSim_train(TransitionMixin, gym.Env):
     metadata = {'render.modes': ['human']}
 
     def __init__(self):
@@ -337,118 +338,7 @@ class CrowdSim_train(gym.Env):
 
         return ob
 
-    def onestep_lookahead(self, action):
-        return self.step(action, update=False)
-
-    def step(self, action, update=True):
-        """
-        Compute actions for all agents, detect collision, update environment and return (ob, reward, done, info)
-
-        """
-        human_actions = []
-        for human in self.humans:
-            # observation for humans is always coordinates
-            ob = [other_human.get_observable_state() for other_human in self.humans if other_human != human]
-            if self.robot.visible:
-                ob += [self.robot.get_observable_state()]
-            human_actions.append(human.act(ob))
-
-        # collision detection
-        dmin = float('inf')
-        collision = False
-        for i, human in enumerate(self.humans):
-            px = human.px - self.robot.px
-            py = human.py - self.robot.py
-            if self.robot.kinematics == 'holonomic':
-                vx = human.vx - action.vx
-                vy = human.vy - action.vy
-            else:
-                vx = human.vx - action.v * np.cos(action.r + self.robot.theta)
-                vy = human.vy - action.v * np.sin(action.r + self.robot.theta)
-            ex = px + vx * self.time_step
-            ey = py + vy * self.time_step
-            # closest distance between boundaries of two agents
-            closest_dist = point_to_segment_dist(px, py, ex, ey, 0, 0) - human.radius - self.robot.radius
-            if closest_dist < 0:
-                collision = True
-                # logging.debug("Collision: distance between robot and p{} is {:.2E}".format(i, closest_dist))
-                break
-            elif closest_dist < dmin:
-                dmin = closest_dist
-
-        # collision detection between humans
-        human_num = len(self.humans)
-        for i in range(human_num):
-            for j in range(i + 1, human_num):
-                dx = self.humans[i].px - self.humans[j].px
-                dy = self.humans[i].py - self.humans[j].py
-                dist = (dx ** 2 + dy ** 2) ** (1 / 2) - self.humans[i].radius - self.humans[j].radius
-                if dist < 0:
-                    # detect collision but don't take humans' collision into account
-                    logging.debug('Collision happens between humans in step()')
-
-        # check if reaching the goal
-        end_position = np.array(self.robot.compute_position(action, self.time_step))
-        reaching_goal = norm(end_position - np.array(self.robot.get_goal_position())) < self.robot.radius
-
-        if self.global_time >= self.time_limit - 1:
-            reward = 0
-            done = True
-            info = Timeout()
-        elif collision:
-            reward = self.collision_penalty
-            done = True
-            info = Collision()
-        elif reaching_goal:
-            reward = self.success_reward
-            done = True
-            info = ReachGoal()
-        elif dmin < self.discomfort_dist:
-            # only penalize agent for getting too close if it's visible
-            # adjust the reward based on FPS
-            reward = (dmin - self.discomfort_dist) * self.discomfort_penalty_factor * self.time_step
-            done = False
-            info = Danger(dmin)
-        else:
-            reward = 0
-            done = False
-            info = Nothing()
-
-        if update:
-            # store state, action value and attention weights
-            self.states.append([self.robot.get_full_state(), [human.get_full_state() for human in self.humans]])
-            if hasattr(self.robot.policy, 'action_values'):
-                self.action_values.append(self.robot.policy.action_values)
-            if hasattr(self.robot.policy, 'get_attention_weights'):
-                self.attention_weights.append(self.robot.policy.get_attention_weights())
-
-            # update all agents
-            self.robot.step(action)
-            for i, human_action in enumerate(human_actions):
-                self.humans[i].step(human_action)
-            self.global_time += self.time_step
-            for i, human in enumerate(self.humans):
-                # only record the first time the human reaches the goal
-                if self.human_times[i] == 0 and human.reached_destination():
-                    self.human_times[i] = self.global_time
-
-            # compute the observation
-            if self.robot.sensor == 'coordinates':
-                ob = [human.get_observable_state() for human in self.humans]
-            elif self.robot.sensor == 'RGB':
-                raise NotImplementedError
-        else:
-            if self.robot.sensor == 'coordinates':
-                ob = [human.get_next_observable_state(action) for human, action in zip(self.humans, human_actions)]
-            elif self.robot.sensor == 'RGB':
-                raise NotImplementedError
-
-        return ob, reward, done, info
-        
-############################################################
-# Define the sim environment for the test mode
-############################################################     
-class CrowdSim_test(gym.Env):
+class CrowdSim_test(TransitionMixin, gym.Env):
     metadata = {'render.modes': ['human']}
 
     def __init__(self):
@@ -512,10 +402,10 @@ class CrowdSim_test(gym.Env):
         self.humans_static = [] # config for human static as static obstacles
         # land description used to keep every agent on the water
         self.land_cells = set()     # occupied cells, (i, j) grid indices
+        self.land_rects = np.empty((0, 4))
+        self.map_bounds = None
         self.land_res = 1.0         # size of one cell
         self.land_polygons = []     # merged land rectangles, fed to ORCA as obstacles
-        self.land_max_x = float('inf')
-        self.land_max_y = float('inf')
         self.human_paths = []       # land free route of each dynamic obstacle
         self.human_wp_idx = []      # way point each dynamic obstacle is steering to
         self.human_wp_dir = []      # +1/-1, direction each obstacle is walking its route in
@@ -606,6 +496,7 @@ class CrowdSim_test(gym.Env):
     def generate_static_human(self, px, py, radius):
         human = Human(self.config, 'humans')
         human.set(px, py, px, py, 0, 0, 0, radius=radius, v_pref=0)
+        human.is_static = True
         return human
     
     def generate_circle_crossing_human(self):
@@ -692,29 +583,8 @@ class CrowdSim_test(gym.Env):
         return self.humans
 
     def is_on_land(self, position, clearance=0.0):
-        """
-        True when a world position sits on land, within `clearance` of it, or outside
-        the map. Without a static map loaded everything counts as water.
-        """
-        if not self.land_cells:
-            return False
-        if not (0 <= position[0] <= self.land_max_x and 0 <= position[1] <= self.land_max_y):
-            return True
-        res = self.land_res
-        i = int(math.floor(position[0] / res))
-        j = int(math.floor(position[1] / res))
-        n = int(math.ceil(clearance / res))
-        for di in range(-n, n + 1):
-            for dj in range(-n, n + 1):
-                ni, nj = i + di, j + dj
-                if (ni, nj) not in self.land_cells:
-                    continue
-                # exact distance from the position to that land cell
-                dx = max(ni * res - position[0], 0.0, position[0] - (ni + 1) * res)
-                dy = max(nj * res - position[1], 0.0, position[1] - (nj + 1) * res)
-                if math.hypot(dx, dy) <= clearance:
-                    return True
-        return False
+        gap = static_clearance(position, position, clearance, self.land_rects, self.map_bounds)
+        return gap <= 0 if clearance == 0 else gap < 0
 
     def human_final_goal(self, i):
         """Final goal of a dynamic obstacle, its gx/gy hold the current way point."""
@@ -722,41 +592,45 @@ class CrowdSim_test(gym.Env):
             return self.human_paths[i][-1]
         return self.humans[i].get_goal_position()
 
-    def update_human_goals(self):
-        """
-        Steer every dynamic obstacle at the next way point of its route instead of at
-        its final goal, so ORCA never asks it to cross a landmass. Once an obstacle
-        reaches the end of its route it turns around and retraces it, so it keeps
-        moving for the whole episode instead of stopping once it arrives.
-        """
+    def next_human_goals(self):
+        """Calculate waypoint changes without mutating the current episode."""
+        goals = []
         for i, human in enumerate(self.humans):
             path = self.human_paths[i] if i < len(self.human_paths) else None
-            if not path or len(path) < 2:
-                continue
             idx = self.human_wp_idx[i]
             direction = self.human_wp_dir[i]
+            if not path or len(path) < 2:
+                goals.append((human.get_goal_position(), idx, direction))
+                continue
+            seen = set()
             while math.dist(human.get_position(), path[idx]) < self.human_wp_radius:
+                # Degenerate or very short routes must not loop forever.
+                if (idx, direction) in seen:
+                    break
+                seen.add((idx, direction))
                 next_idx = idx + direction
                 if next_idx < 0 or next_idx >= len(path):
                     direction *= -1
                     next_idx = idx + direction
                 idx = next_idx
+            goals.append((path[idx], idx, direction))
+        return goals
+
+    def commit_human_goals(self, goals):
+        for i, (goal, idx, direction) in enumerate(goals):
             self.human_wp_idx[i] = idx
             self.human_wp_dir[i] = direction
-            human.gx, human.gy = path[idx][0], path[idx][1]
+            self.humans[i].gx, self.humans[i].gy = goal
+
+    def update_human_goals(self):
+        self.commit_human_goals(self.next_human_goals())
 
     def keep_action_on_water(self, human, action):
-        """
-        Last line of defence: refuse a step that would put a dynamic obstacle on land.
-        The move is first tried along x and y separately so the ship slides along the
-        coast instead of stopping dead.
-        """
-        if not self.land_cells:
-            return action
-        margin = human.radius
-        for candidate in (action, ActionXY(action.vx, 0), ActionXY(0, action.vy)):
-            next_position = human.compute_position(candidate, self.time_step)
-            if not self.is_on_land(next_position, clearance=margin):
+        """Check the whole swept circle before accepting a move along the coast."""
+        for candidate in (action, ActionXY(action.vx, 0), ActionXY(0, action.vy), ActionXY(0, 0)):
+            end = human.compute_position(candidate, self.time_step)
+            if static_clearance(human.get_position(), end, human.radius,
+                                self.land_rects, self.map_bounds) >= 0:
                 return candidate
         return ActionXY(0, 0)
 
@@ -803,7 +677,12 @@ class CrowdSim_test(gym.Env):
         return self.human_times
     
     def set_obstacles(self, obstacle_list):
-        # generate static human according to static obstacles
+        # Static agents are network features; rectangles are collision geometry.
+        self.humans_static = []
+        self.land_rects = np.asarray([
+            (o['cx'] - o['w'] / 2, o['cy'] - o['h'] / 2,
+             o['cx'] + o['w'] / 2, o['cy'] + o['h'] / 2)
+            for o in obstacle_list], dtype=float).reshape(-1, 4)
         for obs in obstacle_list:
             self.humans_static.append(self.generate_static_human(obs['cx'], obs['cy'], obs['w']/2))
 
@@ -816,8 +695,6 @@ class CrowdSim_test(gym.Env):
                 i = int(round((obs['cx'] - obs['w'] / 2) / self.land_res))
                 j = int(round((obs['cy'] - obs['h'] / 2) / self.land_res))
                 self.land_cells.add((i, j))
-        self.land_max_x = (max(i for i, _ in self.land_cells) + 1) * self.land_res if self.land_cells else float('inf')
-        self.land_max_y = (max(j for _, j in self.land_cells) + 1) * self.land_res if self.land_cells else float('inf')
         self.land_polygons = self.build_land_polygons()
 
     def build_land_polygons(self):
@@ -854,6 +731,7 @@ class CrowdSim_test(gym.Env):
         self.env_y_max = init_para['y_max']
         self.grid_resolution = init_para['grid_res']
         self.nearby_dist = init_para['nearby_dist']
+        self.map_bounds = (self.env_x_min, self.env_y_min, self.env_x_max, self.env_y_max)
 
     def set_local_goal_list(self, global_path):
         self.robot_start = [global_path[-1][0], global_path[-1][1]]
@@ -881,21 +759,10 @@ class CrowdSim_test(gym.Env):
         return human_nearby
 
     def light_reset(self, phase='test', test_case=None):
-        """
-        Set px, py, gx, gy, vx, vy, theta for robot and humans
-        :return:
-        """
-        self.global_time = 0
+        """Refresh observations without resetting the episode clock."""
+        return self.observe_at(self.robot.get_position())
 
-        # get current observation
-        if self.robot.sensor == 'coordinates':
-            ob = [human.get_observable_state() for human in self.get_humans_nearby()]
-        elif self.robot.sensor == 'RGB':
-            raise NotImplementedError
-
-        return ob
-    
-    def reset(self, phase='test', test_case=None, dym_obs_list=[]):
+    def reset(self, phase='test', test_case=None, dym_obs_list=None):
         """
         Set px, py, gx, gy, vx, vy, theta for robot and humans
         :return:
@@ -910,7 +777,7 @@ class CrowdSim_test(gym.Env):
         self.robot.set(self.robot_start[0], self.robot_start[1], self.robot_end[0], self.robot_end[1], 0, 0, np.pi / 2)
 
         # generate dynamic obstacles
-        self.generate_dynamic_humans(dym_obs_list)
+        self.generate_dynamic_humans(dym_obs_list or [])
         self.human_num = len(self.humans) # static human not included
         self.human_times = [0] * self.human_num
 
@@ -935,119 +802,6 @@ class CrowdSim_test(gym.Env):
             raise NotImplementedError
 
         return ob
-
-    def onestep_lookahead(self, action):
-        return self.step(action, update=False)
-
-    def step(self, action, update=True):
-        """
-        Compute actions for all agents, detect collision, update environment and return (ob, reward, done, info)
-
-        """
-        # steer every dynamic obstacle at the next way point of its land free route
-        self.update_human_goals()
-
-        human_actions = []
-        for human in self.humans:
-            # observation for humans is always coordinates
-            ob = [other_human.get_observable_state() for other_human in self.humans if other_human != human]
-            if self.robot.visible:
-                ob += [self.robot.get_observable_state()]
-            # the land itself is handed to the policy as static obstacles, see reset()
-            human_actions.append(self.keep_action_on_water(human, human.act(ob)))
-
-        # collision detection
-        dmin = float('inf')
-        collision = False
-        for i, human in enumerate(self.get_humans_nearby()):
-            px = human.px - self.robot.px
-            py = human.py - self.robot.py
-            if self.robot.kinematics == 'holonomic':
-                vx = human.vx - action.vx
-                vy = human.vy - action.vy
-            else:
-                vx = human.vx - action.v * np.cos(action.r + self.robot.theta)
-                vy = human.vy - action.v * np.sin(action.r + self.robot.theta)
-            ex = px + vx * self.time_step
-            ey = py + vy * self.time_step
-            # closest distance between boundaries of two agents
-            closest_dist = point_to_segment_dist(px, py, ex, ey, 0, 0) - human.radius - self.robot.radius
-            if closest_dist < 0:
-                collision = True
-                # logging.debug("Collision: distance between robot and p{} is {:.2E}".format(i, closest_dist))
-                break
-            elif closest_dist < dmin:
-                dmin = closest_dist
-
-        # collision detection between humans
-        human_num = len(self.humans)
-        for i in range(human_num):
-            for j in range(i + 1, human_num):
-                dx = self.humans[i].px - self.humans[j].px
-                dy = self.humans[i].py - self.humans[j].py
-                dist = (dx ** 2 + dy ** 2) ** (1 / 2) - self.humans[i].radius - self.humans[j].radius
-                if dist < 0:
-                    # detect collision but don't take humans' collision into account
-                    logging.debug('Collision happens between humans in step()')
-
-        # check if reaching the goal
-        end_position = np.array(self.robot.compute_position(action, self.time_step))
-        reaching_goal = norm(end_position - np.array(self.robot.get_goal_position())) < self.robot.radius
-
-        if self.global_time >= self.time_limit - 1:
-            reward = 0
-            done = True
-            info = Timeout()
-        elif collision:
-            reward = self.collision_penalty
-            done = True
-            info = Collision()
-        elif reaching_goal:
-            reward = self.success_reward
-            done = True
-            info = ReachGoal()
-        elif dmin < self.discomfort_dist:
-            # only penalize agent for getting too close if it's visible
-            # adjust the reward based on FPS
-            reward = (dmin - self.discomfort_dist) * self.discomfort_penalty_factor * self.time_step
-            done = False
-            info = Danger(dmin)
-        else:
-            reward = 0
-            done = False
-            info = Nothing()
-
-        if update:
-            # store state, action value and attention weights
-            self.states.append([self.robot.get_full_state(), [human.get_full_state() for human in self.humans]])
-            if hasattr(self.robot.policy, 'action_values'):
-                self.action_values.append(self.robot.policy.action_values)
-            if hasattr(self.robot.policy, 'get_attention_weights'):
-                self.attention_weights.append(self.robot.policy.get_attention_weights())
-
-            # update all agents
-            self.robot.step(action)
-            for i, human_action in enumerate(human_actions):
-                self.humans[i].step(human_action)
-            self.global_time += self.time_step
-            for i, human in enumerate(self.humans):
-                # only record the first time the human reaches its final goal
-                if self.human_times[i] == 0 and \
-                        math.dist(human.get_position(), self.human_final_goal(i)) < human.radius:
-                    self.human_times[i] = self.global_time
-
-            # compute the observation
-            if self.robot.sensor == 'coordinates':
-                ob = [human.get_observable_state() for human in self.get_humans_nearby()]
-            elif self.robot.sensor == 'RGB':
-                raise NotImplementedError
-        else:
-            if self.robot.sensor == 'coordinates':
-                ob = [human.get_next_observable_state(action) for human, action in zip(self.humans, human_actions)]
-            elif self.robot.sensor == 'RGB':
-                raise NotImplementedError
-
-        return ob, reward, done, info
 
     def render(self, mode='human', output_file=None):
         from matplotlib import animation

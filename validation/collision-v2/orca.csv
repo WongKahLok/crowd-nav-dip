@@ -1,0 +1,5 @@
+map,seed,n_dynamic,outcome,steps,sim_time,travelled_dist,planned_dist,detour_ratio,min_sep_dynamic,min_sep_static,danger_frac,plan_cost,start_x,start_y,goal_x,goal_y,requested_n_dynamic,collision_kind,metrics_version
+land_shapes_sf_crop,0,0,success,100,25.0,24.535,25.051,0.979,,0.595679,0.0,25.051,31,40,27,19,0,,2
+land_shapes_sf_crop,0,4,success,99,24.75,23.558,25.051,0.94,0.560202,0.009999,0.242424,25.051,31,40,27,19,4,,2
+land_shapes_ht_crop,0,0,success,134,33.5,31.114,31.401,0.991,,0.407107,0.0,31.401,22,16,17,47,0,,2
+land_shapes_ht_crop,0,4,success,134,33.5,31.114,31.401,0.991,7.027896,0.407107,0.0,31.401,22,16,17,47,4,,2

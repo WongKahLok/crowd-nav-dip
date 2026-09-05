@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torch.nn.functional import softmax
 import logging
 from crowd_nav.policy.cadrl import mlp
 from crowd_nav.policy.multi_human_rl import MultiHumanRL
@@ -34,12 +33,15 @@ class ValueNetwork(nn.Module):
         """
         size = state.shape
         self_state = state[:, 0, :self.self_state_dim]
+        valid = state[:, :, self.self_state_dim:].abs().sum(dim=2) > 0
         mlp1_output = self.mlp1(state.view((-1, size[2])))
         mlp2_output = self.mlp2(mlp1_output)
 
         if self.with_global_state:
             # compute attention scores
-            global_state = torch.mean(mlp1_output.view(size[0], size[1], -1), 1, keepdim=True)
+            embeddings = mlp1_output.view(size[0], size[1], -1)
+            count = valid.sum(dim=1, keepdim=True).clamp_min(1).unsqueeze(2)
+            global_state = (embeddings * valid.unsqueeze(2)).sum(dim=1, keepdim=True) / count
             global_state = global_state.expand((size[0], size[1], self.global_state_dim)).\
                 contiguous().view(-1, self.global_state_dim)
             attention_input = torch.cat([mlp1_output, global_state], dim=1)
@@ -47,11 +49,11 @@ class ValueNetwork(nn.Module):
             attention_input = mlp1_output
         scores = self.attention(attention_input).view(size[0], size[1], 1).squeeze(dim=2)
 
-        # masked softmax
-        # weights = softmax(scores, dim=1).unsqueeze(2)
-        scores_exp = torch.exp(scores) * (scores != 0).float()
-        weights = (scores_exp / torch.sum(scores_exp, dim=1, keepdim=True)).unsqueeze(2)
-        self.attention_weights = weights[0, :, 0].data.cpu().numpy()
+        # Mask explicit empty interaction rows, never numerical score values.
+        scores = scores.masked_fill(~valid, torch.finfo(scores.dtype).min)
+        weights = torch.softmax(scores, dim=1) * valid
+        weights = weights.unsqueeze(2)
+        self.attention_weights = weights[0, valid[0], 0].detach().cpu().numpy()
 
         # output feature is a linear combination of input features
         features = mlp2_output.view(size[0], size[1], -1)
