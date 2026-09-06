@@ -65,6 +65,45 @@ without changing the episode clock, waypoints, policy simulator or history.
 Both paths use configured rewards and omit future value at terminal states.
 Local goals shape reward; only the final route goal terminates navigation.
 
+## Local goals and the SARL action pipeline
+
+`crowd_nav/utils/local_goal.py` replaces the per-frame nearest-point search.
+The tracker keeps a progress index along the dense route and only searches
+forward of it (never backwards, and only to points the ship can see), so the
+goal cannot jump to a later leg of a winding route. The look-ahead is
+`--local_goal_dist` on open water and `--monitor_dist` while a moving ship is
+closer than that; monitoring ends only beyond `--monitor_exit_dist` (default
+1.3 x monitor distance), and the look-ahead moves between the two values at
+`--lookahead_rate` m/s instead of switching. A candidate goal is accepted only
+if the straight segment from the ship keeps `--shore_clearance` (plus the
+radius) from land and the map edge; otherwise the goal walks back towards the
+ship, and if nothing is visible the previous goal is kept. The destination
+itself only has to fit the ship.
+
+`SARL.predict` builds its candidate actions from the current velocity using the
+`[motion]` section of `policy.config`: speeds within `max_accel` / `max_decel`
+per step, headings within `max_turn_rate` per step (`heading_samples` around
+the current heading, the current velocity always included, all directions when
+at rest below `stop_speed`). Every candidate is swept over the next step with
+the shared collision geometry and must keep `safety_margin_static` from land
+and `safety_margin_dynamic` from the predicted ships; with `braking_check` it
+must also be able to stop at `max_decel` afterwards without violating those
+margins, and the stopped ship must stay clear of the extrapolated ships for
+`safety_horizon` seconds, so being stopped is never assumed safe. Only safe
+candidates are scored by the value network, and the score is
+reduced by `continuity_weight` per radian of heading change so close scores
+keep the current course; a ship at rest and the stop action pay no penalty.
+Reaching a local goal does not force a stop: the stop action is a candidate
+like any other and must pass the same check. When no candidate is safe the
+policy returns a constrained deceleration: among the non-accelerating
+candidates (or all of them when at rest) the one with the largest swept
+clearance, so stopping into an oncoming ship is not chosen. The action is
+executed exactly as scored. `constrained = false` restores the fixed 81-action
+set; older configs without these sections use the defaults. `evaluate.py`
+records the fraction of steps that used the fallback in the `emergency_frac`
+column. Recorded smoke, sweep and batch results are in
+[validation/local-goal-actions/README.md](validation/local-goal-actions/README.md).
+
 Run from the repository root after installing the project dependencies:
 
 ```sh

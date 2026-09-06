@@ -9,7 +9,8 @@ import gym
 from crowd_nav.utils.explorer import Explorer
 from crowd_nav.policy.policy_factory import policy_factory
 from crowd_nav.utils.theta_star import HybridEnv, ThetaStar
-from crowd_nav.utils.theta_star import interpolate_path, get_local_goal
+from crowd_nav.utils.theta_star import interpolate_path
+from crowd_nav.utils.local_goal import LocalGoalTracker
 from crowd_sim.envs.utils.robot import Robot
 from crowd_sim.envs.policy.orca import ORCA
 from crowd_sim.envs.utils.info import ReachGoal, Timeout
@@ -86,6 +87,13 @@ def main():
     parser.add_argument('--colregs', default=False, action='store_true')
     parser.add_argument('--static_map', type=str, default=None)
     parser.add_argument('--max_steps', type=int, default=2000)
+    parser.add_argument('--local_goal_dist', type=float, default=1.0)
+    parser.add_argument('--monitor_dist', type=float, default=5.0)
+    parser.add_argument('--monitor_exit_dist', type=float, default=None,
+                        help='obstacles stop being monitored beyond this, default 1.3 * monitor_dist')
+    parser.add_argument('--lookahead_rate', type=float, default=1.0, help='m/s the look-ahead may change')
+    parser.add_argument('--shore_clearance', type=float, default=0.5,
+                        help='room between the ship-to-goal segment and the land, on top of the radius')
     args = parser.parse_args()
     if args.max_steps <= 0:
         parser.error('max_steps must be positive')
@@ -158,25 +166,29 @@ def main():
 
     policy.set_env(env)
     robot.print_info()
-    local_goal_dist, monitor_dist = 1, 5
     dym_obs_list = build_dynamic_obstacles(env_loaded_safety_dist, DYNAMIC_OBSTACLES,
                                            robot_route, seed=args.test_case or 0)
     ob = env.reset(args.phase, args.test_case, dym_obs_list)
     path_dense = interpolate_path(env.global_path)[1:]
-
-    one_goal = get_local_goal(robot.get_full_state(), ob, path_dense, local_goal_dist, monitor_dist)
-    robot.gx, robot.gy = one_goal[0], one_goal[1]
+    tracker = LocalGoalTracker.from_env(
+        env, path_dense, goal_dist=args.local_goal_dist, monitor_dist=args.monitor_dist,
+        monitor_exit=args.monitor_exit_dist, lookahead_rate=args.lookahead_rate,
+        shore_clearance=args.shore_clearance)
+    robot.gx, robot.gy = tracker.update(robot.get_full_state(), ob)
     info = None
+    emergency_steps = 0
     for _ in range(args.max_steps):
         ob = env.light_reset(args.phase, args.test_case)
         action = robot.act(ob)
+        emergency_steps += bool(getattr(policy, 'emergency', False))
         ob, _, done, info = env.step(action)
         if done:
             break
-        one_goal = get_local_goal(robot.get_full_state(), ob, path_dense, local_goal_dist, monitor_dist)
-        robot.gx, robot.gy = one_goal[0], one_goal[1]
+        robot.gx, robot.gy = tracker.update(robot.get_full_state(), ob)
     else:
         info = Timeout()
+    if hasattr(policy, 'emergency'):
+        logging.info('Emergency fallback used in %d of %d steps', emergency_steps, len(env.states))
 
     if args.visualize:
         if args.traj:

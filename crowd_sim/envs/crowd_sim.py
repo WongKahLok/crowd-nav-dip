@@ -1003,12 +1003,31 @@ class CrowdSim_test(TransitionMixin, gym.Env):
                                                              agent.vx, agent.vy, agent.theta))
                 # when any key is pressed draw the action value plot
                 fig, axis = plt.subplots()
-                speeds = [0] + self.robot.policy.speeds
-                rotations = self.robot.policy.rotations + [np.pi * 2]
+                values = np.array(self.action_values[global_step % len(self.states)], dtype=float)
+                policy = self.robot.policy
+                if policy.speeds is None:
+                    # candidate set changes every step with the kinematic limits:
+                    # show the values of the last prediction in velocity space
+                    candidates = policy.candidates or []
+                    values = np.array(policy.action_values, dtype=float)
+                    safe = np.array(policy.safe_mask, dtype=bool)
+                    vx = np.array([a.vx for a in candidates])
+                    vy = np.array([a.vy for a in candidates])
+                    scatter = axis.scatter(vx[safe], vy[safe], c=values[safe], s=60)
+                    axis.scatter(vx[~safe], vy[~safe], marker='x', color='r', label='unsafe')
+                    axis.set_xlabel('vx (m/s)')
+                    axis.set_ylabel('vy (m/s)')
+                    axis.set_aspect('equal')
+                    axis.legend()
+                    fig.colorbar(scatter, ax=axis)
+                    plt.show()
+                    return
+                speeds = [0] + policy.speeds
+                rotations = list(policy.rotations) + [np.pi * 2]
                 r, th = np.meshgrid(speeds, rotations)
-                z = np.array(self.action_values[global_step % len(self.states)][1:])
+                z = values[1:]
                 z = (z - np.min(z)) / (np.max(z) - np.min(z))
-                z = np.reshape(z, (16, 5))
+                z = np.reshape(z, (len(rotations) - 1, len(speeds) - 1))
                 polar = plt.subplot(projection="polar")
                 polar.tick_params(labelsize=16)
                 mesh = plt.pcolormesh(th, r, z, vmin=0, vmax=1)

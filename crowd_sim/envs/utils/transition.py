@@ -42,12 +42,27 @@ class TransitionMixin:
             self.time_limit, self.time_step, self.success_reward, self.collision_penalty,
             self.discomfort_dist, self.discomfort_penalty_factor)
 
+    def predict_humans(self, state, query=False):
+        """Current and next observable states of the moving agents.
+
+        With ``query`` the agents' own policies are previewed without changing
+        the episode, exactly as ``onestep_lookahead`` does; otherwise observed
+        velocities are extrapolated. The result does not depend on the robot's
+        action, so a policy can compute it once and assess every candidate
+        action against it with ``assess_motion``.
+        """
+        if query:
+            actions, _, _ = self._human_moves(update=False)
+            humans = [h.get_observable_state() for h in self.humans]
+            return humans, [advance(h, a, self.time_step) for h, a in zip(humans, actions)]
+        humans = [h for h in state.human_states if not h.is_static]
+        return humans, [advance(h, ActionXY(h.vx, h.vy), self.time_step) for h in humans]
+
     def predict_linear(self, state, action):
         """Use observed velocities for prediction, plus known map geometry."""
         nav = state.self_state
         next_nav = advance(nav, action, self.time_step)
-        humans = [h for h in state.human_states if not h.is_static]
-        next_humans = [advance(h, ActionXY(h.vx, h.vy), self.time_step) for h in humans]
+        humans, next_humans = self.predict_humans(state)
         reward, done, info = self.assess_motion(nav, next_nav, humans, next_humans)
         return self.observe_at(next_nav.position, next_humans), reward, done, info
 

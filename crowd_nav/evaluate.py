@@ -21,7 +21,8 @@ import numpy as np
 import torch
 
 from crowd_nav.policy.policy_factory import policy_factory
-from crowd_nav.utils.theta_star import HybridEnv, ThetaStar, get_local_goal, interpolate_path
+from crowd_nav.utils.local_goal import LocalGoalTracker
+from crowd_nav.utils.theta_star import HybridEnv, ThetaStar, interpolate_path
 from crowd_sim.envs.utils.info import Collision, ReachGoal, Timeout
 from crowd_sim.envs.utils.robot import Robot
 
@@ -30,7 +31,7 @@ GRID_X, GRID_Y, GRID_RES = 50, 50, 1  # same discretisation test.py uses
 CSV_FIELDS = ['map', 'seed', 'n_dynamic', 'outcome', 'steps', 'sim_time', 'travelled_dist',
               'planned_dist', 'detour_ratio', 'min_sep_dynamic', 'min_sep_static',
               'danger_frac', 'plan_cost', 'start_x', 'start_y', 'goal_x', 'goal_y',
-              'requested_n_dynamic', 'collision_kind', 'metrics_version']
+              'requested_n_dynamic', 'collision_kind', 'metrics_version', 'emergency_frac']
 
 
 def build_grids(map_path, safety_distance):
@@ -83,21 +84,26 @@ def run_episode(env, robot, sim_grid, scenario, cfg):
     planned = sum(math.dist(a, b) for a, b in zip(full_path, full_path[1:]))
 
     if cfg.no_global_plan:
+        tracker = None
         robot.gx, robot.gy = full_path[-1]
     else:
-        robot.gx, robot.gy = get_local_goal(robot.get_full_state(), ob, path_dense,
-                                          cfg.local_goal_dist, cfg.monitor_dist)
+        tracker = LocalGoalTracker.from_env(
+            env, path_dense, goal_dist=cfg.local_goal_dist, monitor_dist=cfg.monitor_dist,
+            monitor_exit=cfg.monitor_exit_dist, lookahead_rate=cfg.lookahead_rate,
+            shore_clearance=cfg.shore_clearance)
+        robot.gx, robot.gy = tracker.update(robot.get_full_state(), ob)
 
     nav = robot.get_full_state()
     humans = [h.get_observable_state() for h in env.humans]
     _, _, initial = env.assess_motion(nav, nav, humans, humans, end_time=env.global_time)
     min_sep_dyn, min_sep_stat = initial.min_sep_dynamic, initial.min_sep_static
-    travelled, danger_steps, steps = 0.0, 0, 0
+    travelled, danger_steps, emergency_steps, steps = 0.0, 0, 0, 0
     outcome, collision_kind = 'timeout', None
 
     for steps in range(1, cfg.max_steps + 1):
         ob = env.light_reset('test', None)
         action = robot.act(ob)
+        emergency_steps += bool(getattr(robot.policy, 'emergency', False))
         prev = robot.get_position()
         ob, _, done, info = env.step(action)
         travelled += math.dist(prev, robot.get_position())
@@ -119,9 +125,8 @@ def run_episode(env, robot, sim_grid, scenario, cfg):
             else:
                 raise ValueError('Unexpected terminal info: {}'.format(info))
             break
-        if not cfg.no_global_plan:
-            robot.gx, robot.gy = get_local_goal(robot.get_full_state(), ob, path_dense,
-                                              cfg.local_goal_dist, cfg.monitor_dist)
+        if tracker is not None:
+            robot.gx, robot.gy = tracker.update(robot.get_full_state(), ob)
 
     if not math.isclose(env.global_time, steps * env.time_step, rel_tol=0, abs_tol=1e-8):
         raise AssertionError('Episode time does not match executed steps')
@@ -141,6 +146,8 @@ def run_episode(env, robot, sim_grid, scenario, cfg):
         'n_dynamic': len(env.humans),
         'collision_kind': collision_kind or '',
         'metrics_version': 2,
+        'emergency_frac': (round(emergency_steps / steps, 6)
+                           if steps and hasattr(robot.policy, 'emergency') else ''),
     }
 
 
@@ -191,6 +198,11 @@ def main():
                         help='B1 baseline: ignore the Theta* route and steer at the final goal')
     parser.add_argument('--local_goal_dist', type=float, default=1.0)
     parser.add_argument('--monitor_dist', type=float, default=5.0)
+    parser.add_argument('--monitor_exit_dist', type=float, default=None,
+                        help='obstacles stop being monitored beyond this, default 1.3 * monitor_dist')
+    parser.add_argument('--lookahead_rate', type=float, default=1.0, help='m/s the look-ahead may change')
+    parser.add_argument('--shore_clearance', type=float, default=0.5,
+                        help='room between the ship-to-goal segment and the land, on top of the radius')
     parser.add_argument('--max_steps', type=int, default=500)  # 500 * 0.25s = 125s per episode
     parser.add_argument('--safety_distance', type=int, default=1)
     parser.add_argument('--min_route_len', type=float, default=20.0)
