@@ -9,6 +9,10 @@ class BaseScreen(QWidget):
 
     title = "Screen"
 
+    # Set False in subclasses whose content should expand to fill the screen
+    # (e.g. a canvas) rather than sit at its natural size with empty space below.
+    trailing_stretch = True
+
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
