@@ -31,10 +31,19 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         for screen_cls in SCREENS:
             self.nav_list.addItem(screen_cls.title)
-            self.stack.addWidget(screen_cls())
+            self.stack.addWidget(screen)
+            self.screens[secreen_cls] = screen
 
         self.nav_list.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.nav_list.setCurrentRow(0)
 
         root_layout.addWidget(self.nav_list)
         root_layout.addWidget(self.stack, stretch=1)
+
+        # the map loaded on Setup is shown as the Visualize screen's backdrop
+        setup_screen = self.screens[SetupScreen]
+        visualize_screen = self.screens[VisualizeScreen]
+        setup_screen.map_loaded.connect(visualize_screen.set_map)
+        if setup_screen.current_map is not None:
+            # Setup auto-loads its default map before this connection exists
+            visualize_screen.set_map(setup_screen.current_map)
