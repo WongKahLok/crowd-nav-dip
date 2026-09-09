@@ -7,6 +7,9 @@ setup(
     packages=[
         'crowd_nav',
         'crowd_nav.configs',
+        'crowd_nav.gui',
+        'crowd_nav.gui.screens',
+        'crowd_nav.gui.widgets',
         'crowd_nav.policy',
         'crowd_nav.utils',
         'crowd_sim',
@@ -19,6 +22,7 @@ setup(
         'gym',
         'matplotlib',
         'numpy',
+        'PyQt6',
         'scipy',
         'torch',
         'torchvision',
