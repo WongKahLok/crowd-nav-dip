@@ -51,6 +51,46 @@ python test.py \
                --video_file data/output-trained/test_case_1.mp4 \
                --static_map ../static_maps/land_shapes_ht_crop.png
 ```
+## Scenario GUI
+
+`crowd_nav/gui.py` is a PyQt5 window for building a scenario by hand instead of editing
+`DYNAMIC_OBSTACLES` in `test.py`. Run it from the repository root:
+
+```
+python -m crowd_nav.gui [--model_dir DIR] [--map PNG] [--gpu] [--colregs] [--safety_distance 1]
+```
+
+The left half is one matplotlib axes that is both the map and the playback screen; the
+right half is the control panel; the log is at the bottom.
+
+1. **Map** - pick one of `static_maps/*.png` or browse for another, then *Load*.
+2. **Start / goal** - choose *Set start* or *Set goal* and click the water. The click is
+   snapped to the centre of its 50x50 cell and that snapped point is what the ship gets,
+   so the marker is where the ship will actually be. Land, the one metre safety belt from
+   the planning grid, and clicks off the canvas are refused in red. Setting the goal plans
+   the route with Theta* immediately and prints the cost.
+3. **Obstacle ships** - how many (0-20) and which seed, then *Generate random*. They are placed
+   by `generate_crossing_obstacles`, so each one crosses the ship's own route and gets its
+   own land-free path; coordinates land in the table. The same seed always gives the same
+   ships, and pressing *Generate random* again bumps the seed. Zero ships is allowed: only the
+   static map is simulated. If fewer than requested could be placed you get the actual
+   count and a warning.
+4. **Run** - `max_steps`, the GPU toggle, then *Run*. The episode runs on a worker thread,
+   so the window keeps redrawing and *Cancel* is immediate; the progress bar reports steps.
+5. **Playback** - play/pause, 0.5x-4x speed, and a frame slider; the label shows simulated
+   time. The land is drawn as a single patch collection, which is what makes scrubbing
+   smooth on a 50x50 map.
+6. **Result** - `outcome`, `steps`, `sim_time`, travelled/planned/detour, the two minimum
+   separations, `danger_frac` and `emergency_frac`, straight from `evaluate.run_episode`.
+7. **Export** - *Export MP4…* writes the episode with the offscreen Agg figure. Without
+   ffmpeg on the machine it falls back to a `.gif` and the log names the file that was
+   actually written.
+
+The window is a thin shell over `crowd_nav/session.py`, which holds the scenario and can
+be driven from a script or a test with no Qt at all. `crowd_nav/evaluate.py` gained
+`build_env(...)` (the environment wiring `main()` and `test.py` used to duplicate),
+`run_episode(..., on_step=...)` and `EpisodeCancelled` for cancellation.
+
 ## Collision checks and evaluation (metrics v2)
 
 Prediction and execution use the same swept-motion geometry: circles for moving

@@ -19,6 +19,7 @@ setup(
         'gym',
         'matplotlib',
         'numpy',
+        'PyQt5',
         'scipy',
         'torch',
         'torchvision',

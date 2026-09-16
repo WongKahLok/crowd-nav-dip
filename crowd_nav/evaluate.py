@@ -34,6 +34,10 @@ CSV_FIELDS = ['map', 'seed', 'n_dynamic', 'outcome', 'steps', 'sim_time', 'trave
               'requested_n_dynamic', 'collision_kind', 'metrics_version', 'emergency_frac']
 
 
+class EpisodeCancelled(Exception):
+    """Raised out of an ``on_step`` callback to abandon the running episode."""
+
+
 def build_grids(map_path, safety_distance):
     """Two grids from one image: raw for simulated geometry, inflated for planning (as test.py)."""
     sim_grid = HybridEnv(x_range=GRID_X, y_range=GRID_Y, resolution=GRID_RES, safety_distance=0)
@@ -72,8 +76,30 @@ def sample_scenario(plan_grid, cells, n_dynamic, min_route_len, max_tries=200):
     return None
 
 
-def run_episode(env, robot, sim_grid, scenario, cfg):
-    """Run one episode; all safety metrics come from the executed transitions."""
+def build_env(env_config, args, policy, sim_grid):
+    """One simulator wired to one loaded map and one loaded policy.
+
+    The same eight lines were open coded in ``main`` and in test.py; keeping them here
+    means the GUI session and the batch evaluator cannot drift apart.
+    ``args`` only has to carry ``colregs``, which ``CrowdSim_test.configure`` reads.
+    """
+    env = gym.make('CrowdSimTest-v0')
+    env.configure(env_config, args)
+    robot = Robot(env_config, 'robot')
+    robot.set_policy(policy)
+    env.set_robot(robot)
+    env.set_obstacles(sim_grid.get_static_obstacles())
+    env.set_init_para(sim_grid.get_env_para())
+    policy.set_env(env)
+    return env, robot
+
+
+def run_episode(env, robot, sim_grid, scenario, cfg, on_step=None):
+    """Run one episode; all safety metrics come from the executed transitions.
+
+    ``on_step(steps_done, max_steps)`` is called after every executed step; raising
+    :class:`EpisodeCancelled` from it abandons the episode.
+    """
     if cfg.max_steps <= 0:
         raise ValueError('max_steps must be positive')
     env.time_limit = cfg.max_steps * env.time_step
@@ -111,6 +137,8 @@ def run_episode(env, robot, sim_grid, scenario, cfg):
         min_sep_stat = min(min_sep_stat, info.min_sep_static)
         if min(info.min_sep_dynamic, info.min_sep_static) < env.discomfort_dist:
             danger_steps += 1
+        if on_step is not None:
+            on_step(steps, cfg.max_steps)
 
         if done:
             if isinstance(info, Collision):
@@ -233,14 +261,7 @@ def main():
             cells = free_cells(plan_grid)
 
             # Each map gets its own environment and episode geometry.
-            env = gym.make('CrowdSimTest-v0')
-            env.configure(env_config, cfg)
-            robot = Robot(env_config, 'robot')
-            robot.set_policy(policy)
-            env.set_robot(robot)
-            env.set_obstacles(sim_grid.get_static_obstacles())
-            env.set_init_para(sim_grid.get_env_para())
-            policy.set_env(env)
+            env, robot = build_env(env_config, cfg, policy, sim_grid)
 
             for n_dyn in densities:
                 for i in range(cfg.episodes):

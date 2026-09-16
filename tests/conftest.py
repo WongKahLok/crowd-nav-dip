@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from crowd_nav.policy.sarl import SARL
 from crowd_sim.envs.crowd_sim import CrowdSim_test, CrowdSim_train
@@ -13,6 +14,29 @@ from crowd_sim.envs.utils.action import ActionXY
 from crowd_sim.envs.utils.robot import Robot
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def pytest_configure(config):
+    config.addinivalue_line('markers', 'slow: needs the trained weights and a few seconds')
+
+
+def write_map(path, white_rows=None, blocks=(), size=50):
+    """A 50x50 map PNG: white = water, black = land.
+
+    `blocks` are (col0, row0, col1, row1) in *image* coordinates, where row 0 becomes the
+    top of the world once ``load_from_image`` has flipped it.
+    """
+    image = Image.new('L', (size, size), 0 if white_rows is not None else 255)
+    px = image.load()
+    for row in (white_rows or ()):
+        for col in range(size):
+            px[col, row] = 255
+    for col0, row0, col1, row1 in blocks:
+        for row in range(row0, row1):
+            for col in range(col0, col1):
+                px[col, row] = 0
+    image.save(str(path))
+    return path
 
 
 class FixedPolicy(Policy):

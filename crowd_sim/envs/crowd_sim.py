@@ -1,35 +1,18 @@
 import logging
 import gym
 import math
-import os
-import shutil
-import matplotlib.lines as mlines
 import numpy as np
 import rvo2
 from PIL import Image
-from matplotlib import patches
 from numpy.linalg import norm
 from crowd_sim.envs.utils.action import ActionXY
 from crowd_sim.envs.utils.human import Human
 from crowd_sim.envs.utils.info import *
 from crowd_sim.envs.utils.collision import static_clearance
 from crowd_sim.envs.utils.transition import TransitionMixin
-
-def find_ffmpeg():
-    """
-    Locate an ffmpeg binary. PATH first, then the one shipped with imageio-ffmpeg,
-    then the usual system location. Hard coding /usr/bin/ffmpeg breaks on any machine
-    that keeps it somewhere else, a conda environment for instance.
-    """
-    ffmpeg = shutil.which('ffmpeg')
-    if ffmpeg is not None:
-        return ffmpeg
-    try:
-        import imageio_ffmpeg
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        pass
-    return '/usr/bin/ffmpeg' if os.path.exists('/usr/bin/ffmpeg') else None
+# Episode playback and encoding live in render.py: the GUI embeds the same artists without
+# pyplot, and find_ffmpeg is re-exported here because it used to be defined in this module.
+from crowd_sim.envs.render import EpisodeAnimation, find_ffmpeg, save_animation
 
 
 ############################################################
@@ -804,22 +787,12 @@ class CrowdSim_test(TransitionMixin, gym.Env):
         return ob
 
     def render(self, mode='human', output_file=None):
-        from matplotlib import animation
         import matplotlib.pyplot as plt
-        ffmpeg = find_ffmpeg()
-        if ffmpeg is not None:
-            plt.rcParams['animation.ffmpeg_path'] = ffmpeg
 
         x_offset = 0.11
         y_offset = 0.11
         cmap = plt.cm.get_cmap('hsv', 10)
         robot_color = 'yellow'
-        start_color = 'blue'
-        goal_color = 'red'
-        outer_color = 'm'
-        detect_color = 'orange'
-        arrow_color = 'red'
-        arrow_style = patches.ArrowStyle("->", head_length=4, head_width=2)
 
         if mode == 'human':
             fig, ax = plt.subplots(figsize=(7, 7))
@@ -873,137 +846,17 @@ class CrowdSim_test(TransitionMixin, gym.Env):
             plt.show()
         elif mode == 'video':
             fig, ax = plt.subplots(figsize=(7, 7))
-            ax.tick_params(labelsize=16)
-            ax.set_xlim(self.env_x_min, self.env_x_max)
-            ax.set_ylim(self.env_y_min, self.env_y_max)
-            ax.set_xlabel('x(m)', fontsize=16)
-            ax.set_ylabel('y(m)', fontsize=16)
-
-            # plot the static obstacles
-            for obs in self.humans_static:
-                rect = patches.Rectangle((obs.px-obs.radius, obs.py-obs.radius),
-                                         obs.radius*2, obs.radius*2, color='gray', alpha=0.5)
-                # rect = patches.Rectangle((obs['cx']-obs['w']/2, obs['cy']-obs['w']/2),
-                #                             obs['w'], obs['w'], color='gray', alpha=0.5)
-                ax.add_patch(rect)
-
-            # plot the gobal path
-            path_x, path_y = zip(*list(self.global_path))
-            ax.plot(path_x, path_y, 'k--', label='Global Path', linewidth=1)
-
-            # add start and end points
-            start = mlines.Line2D([self.robot_start[0]], [self.robot_start[1]], color=start_color,
-                                 marker='s', linestyle='None', markersize=6, label='Start')
-            goal = mlines.Line2D([self.robot_end[0]], [self.robot_end[1]], color=goal_color,
-                                 marker='*', linestyle='None', markersize=15, label='Goal')
-            ax.add_artist(start)
-            ax.add_artist(goal)
-
-            # add robot and its goal
-            robot_positions = [state[0].position for state in self.states]
-            robot = plt.Circle(robot_positions[0], self.robot.radius, fill=True, color=robot_color)
-            ax.add_artist(robot)
-            goal_positions = [(state[0].gx, state[0].gy) for state in self.states]
-            goal_local = plt.Circle((self.robot.gx, self.robot.gy), self.robot.radius, fill=True, color=outer_color)
-            ax.add_artist(goal_local)
-            outer_radius = [math.dist((state[0].px, state[0].py),(state[0].gx, state[0].gy)) for state in self.states]
-            robot_outer = plt.Circle(robot_positions[0], self.robot.radius, fill=False, color=outer_color, linestyle='--', linewidth=1)
-            ax.add_artist(robot_outer)
-            detect_radius = [5 for state in self.states]
-            robot_detector = plt.Circle(robot_positions[0], self.robot.radius, fill=False, color=detect_color, linestyle='--', linewidth=1)
-            ax.add_artist(robot_detector)
-            plt.legend([robot, goal], ['Robot', 'Goal'], fontsize=16, loc='upper right')
-
-            # add humans and their numbers
-            human_positions = [[state[1][j].position for j in range(len(self.humans))] for state in self.states]
-            humans = [plt.Circle(human_positions[0][i], self.humans[i].radius, fill=True, color='b')
-                      for i in range(len(self.humans))]
-            # human_numbers = [plt.text(humans[i].center[0] - x_offset, humans[i].center[1] - y_offset, str(i),
-            #                           color='black', fontsize=8) for i in range(len(self.humans))]
-            for i, human in enumerate(humans):
-                ax.add_artist(human)
-                # ax.add_artist(human_numbers[i])
-
-            # add time annotation
-            time = plt.text(self.env_x_min+1, self.env_y_max-3, 'Time: {}'.format(0), fontsize=16)
-            ax.add_artist(time)
-
-            # compute orientation in each step and use arrow to show the direction
-            radius = self.robot.radius
-            if self.robot.kinematics == 'unicycle':
-                orientation = [((state[0].px, state[0].py), (state[0].px + radius * np.cos(state[0].theta),
-                                                             state[0].py + radius * np.sin(state[0].theta))) for state
-                               in self.states]
-                orientations = [orientation]
-            else:
-                # Raw per-frame velocity direction jitters when ORCA makes small avoidance
-                # corrections (worse near the destination, where speed -> 0 and direction
-                # noise dominates). Low-pass filter the heading on the unit circle (to avoid
-                # +-pi wrap-around artifacts) and hold the last heading while nearly stopped.
-                heading_smoothing_alpha = 0.3
-                min_speed_for_heading = 0.05
-                orientations = []
-                for i in range(self.human_num + 1):
-                    orientation = []
-                    smoothed_theta = None
-                    for state in self.states:
-                        if i == 0:
-                            agent_state = state[0]
-                        else:
-                            agent_state = state[1][i - 1]
-                        speed = np.hypot(agent_state.vx, agent_state.vy)
-                        if speed > min_speed_for_heading:
-                            raw_theta = np.arctan2(agent_state.vy, agent_state.vx)
-                            if smoothed_theta is None:
-                                smoothed_theta = raw_theta
-                            else:
-                                blended = (1 - heading_smoothing_alpha) * np.array(
-                                    [np.cos(smoothed_theta), np.sin(smoothed_theta)]) + \
-                                    heading_smoothing_alpha * np.array([np.cos(raw_theta), np.sin(raw_theta)])
-                                smoothed_theta = np.arctan2(blended[1], blended[0])
-                        elif smoothed_theta is None:
-                            smoothed_theta = 0.0
-                        orientation.append(((agent_state.px, agent_state.py), (agent_state.px + radius * np.cos(smoothed_theta),
-                                             agent_state.py + radius * np.sin(smoothed_theta))))
-                    orientations.append(orientation)
-            arrows = [patches.FancyArrowPatch(*orientation[0], color=arrow_color, arrowstyle=arrow_style)
-                      for orientation in orientations]
-            for arrow in arrows:
-                ax.add_artist(arrow)
-            global_step = 0
-
-            def update(frame_num):
-                nonlocal global_step
-                nonlocal arrows
-                global_step = frame_num
-                robot.center = robot_positions[frame_num]
-                robot_outer.center = robot_positions[frame_num]
-                robot_outer.radius = outer_radius[frame_num]
-                robot_detector.center = robot_positions[frame_num]
-                robot_detector.radius = detect_radius[frame_num]
-                goal_local.center = goal_positions[frame_num]
-                for i, human in enumerate(humans):
-                    human.center = human_positions[frame_num][i]
-                    # human_numbers[i].set_position((human.center[0] - x_offset, human.center[1] - y_offset))
-                    for arrow in arrows:
-                        arrow.remove()
-                    arrows = [patches.FancyArrowPatch(*orientation[frame_num], color=arrow_color,
-                                                      arrowstyle=arrow_style) for orientation in orientations]
-                    for arrow in arrows:
-                        ax.add_artist(arrow)
-                    # if self.attention_weights is not None:
-                    #     human.set_color(str(self.attention_weights[frame_num][i]))
-
-                time.set_text('Time: {:.2f}'.format(frame_num * self.time_step))
+            scene = EpisodeAnimation(self, ax)
+            anim = scene.animate(fig, self.time_step * 1000)
 
             def plot_value_heatmap():
                 assert self.robot.kinematics == 'holonomic'
-                for agent in [self.states[global_step][0]] + self.states[global_step][1]:
+                for agent in [self.states[scene.frame][0]] + self.states[scene.frame][1]:
                     print(('{:.4f}, ' * 6 + '{:.4f}').format(agent.px, agent.py, agent.gx, agent.gy,
                                                              agent.vx, agent.vy, agent.theta))
                 # when any key is pressed draw the action value plot
                 fig, axis = plt.subplots()
-                values = np.array(self.action_values[global_step % len(self.states)], dtype=float)
+                values = np.array(self.action_values[scene.frame % len(self.states)], dtype=float)
                 policy = self.robot.policy
                 if policy.speeds is None:
                     # candidate set changes every step with the kinematic limits:
@@ -1048,21 +901,9 @@ class CrowdSim_test(TransitionMixin, gym.Env):
                     anim.event_source.start()
 
             fig.canvas.mpl_connect('key_press_event', on_click)
-            anim = animation.FuncAnimation(fig, update, frames=len(self.states), interval=self.time_step * 1000)
-            anim.running = True
 
             if output_file is not None:
-                if animation.writers.is_available('ffmpeg'):
-                    writer = animation.writers['ffmpeg'](fps=8, metadata=dict(artist='Me'), bitrate=1800)
-                else:
-                    # no ffmpeg on this machine, fall back to a gif so the run is not lost
-                    output_file = os.path.splitext(output_file)[0] + '.gif'
-                    logging.warning('ffmpeg not found, writing %s instead. Install it with '
-                                    '"conda install -c conda-forge ffmpeg" or "pip install imageio-ffmpeg"',
-                                    output_file)
-                    writer = animation.PillowWriter(fps=8)
-                anim.save(output_file, writer=writer)
-                logging.info('Video written to %s', output_file)
+                save_animation(anim, output_file)
             else:
                 plt.show()
         else:
