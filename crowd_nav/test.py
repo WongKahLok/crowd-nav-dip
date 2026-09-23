@@ -8,11 +8,14 @@ import numpy as np
 import gym
 from crowd_nav.utils.explorer import Explorer
 from crowd_nav.policy.policy_factory import policy_factory
-from crowd_nav.utils.theta_star import HybridEnv, ThetaStar
-from crowd_nav.utils.theta_star import interpolate_path, get_local_goal
+from crowd_nav.utils.theta_star import ThetaStar
+from crowd_nav.utils.theta_star import interpolate_path
+from crowd_nav.utils.local_goal import LocalGoalTracker
+from crowd_nav.utils.land_map import load_static_map
+from crowd_nav.utils import scenario as scenario_files
 from crowd_sim.envs.utils.robot import Robot
 from crowd_sim.envs.policy.orca import ORCA
-from crowd_sim.envs.utils.info import Timeout
+from crowd_sim.envs.utils.info import ReachGoal, Timeout
 
 # start/goal of the other ships, in world coordinates. Every pair is checked against the
 # static map and gets a land free route before it is handed to the simulator.
@@ -85,7 +88,21 @@ def main():
     parser.add_argument('--traj', default=False, action='store_true')
     parser.add_argument('--colregs', default=False, action='store_true')
     parser.add_argument('--static_map', type=str, default=None)
+    parser.add_argument('--scenario', type=str, default=None,
+                        help='frozen scenario (P5, P8, P12, P15 or a JSON path): the ship task and '
+                             'the obstacle ships come from the file; --static_map picks its map, '
+                             'default the first map it covers')
+    parser.add_argument('--max_steps', type=int, default=2000)
+    parser.add_argument('--local_goal_dist', type=float, default=1.0)
+    parser.add_argument('--monitor_dist', type=float, default=5.0)
+    parser.add_argument('--monitor_exit_dist', type=float, default=None,
+                        help='obstacles stop being monitored beyond this, default 1.3 * monitor_dist')
+    parser.add_argument('--lookahead_rate', type=float, default=1.0, help='m/s the look-ahead may change')
+    parser.add_argument('--shore_clearance', type=float, default=0.5,
+                        help='room between the ship-to-goal segment and the land, on top of the radius')
     args = parser.parse_args()
+    if args.max_steps <= 0:
+        parser.error('max_steps must be positive')
 
     if args.model_dir is not None:
         env_config_file = os.path.join(args.model_dir, os.path.basename(args.env_config))
@@ -100,6 +117,16 @@ def main():
     else:
         env_config_file = args.env_config
         policy_config_file = args.policy_config  # was args.env_config: wrong config loaded when --model_dir is omitted
+
+    scenario_entry = None
+    if args.scenario is not None:
+        try:
+            scenario_data = scenario_files.load_scenario(args.scenario)
+            if args.static_map is None:
+                args.static_map = scenario_files.map_path_of(next(iter(scenario_data['maps'].values())))
+            scenario_entry = scenario_files.entry_for(scenario_data, args.static_map)
+        except (OSError, ValueError, StopIteration) as exc:
+            parser.error(str(exc))
 
     if args.static_map is not None:
         if not os.path.exists(args.static_map):
@@ -117,21 +144,35 @@ def main():
     if policy.trainable:
         if args.model_dir is None:
             parser.error('Trainable policy must be specified with a model weights directory')
-        policy.get_model().load_state_dict(torch.load(model_weights))
-    env_loaded = HybridEnv(x_range=50, y_range=50, resolution=1, safety_distance=0)
-    env_loaded.load_from_image(args.static_map)
-    env_loaded_safety_dist = HybridEnv(x_range=50, y_range=50, resolution=1, safety_distance=1)
-    env_loaded_safety_dist.load_from_image(args.static_map)
-    planner = ThetaStar(start=(40, 5), goal=(32, 42), env=env_loaded_safety_dist)
-    cost, path, expand = planner.plan()
-    if not path:
-        logging.error('No route for the ship on %s, check its start and goal', args.static_map)
-        return
+        policy.get_model().load_state_dict(torch.load(model_weights, map_location=device))
+    # PNG land mask or land_map.py JSON; a raw grid for the simulator, an inflated one for Theta*
+    env_loaded = load_static_map(args.static_map, safety_distance=0)
+    env_loaded_safety_dist = load_static_map(args.static_map, safety_distance=1)
+    if scenario_entry is not None:
+        # the frozen route and ships, not a new plan: the same episode evaluate.py and the GUI run
+        episode = scenario_files.to_episode(scenario_entry)
+        path = episode['path']
+        logging.info('Scenario %s on %s: seed %d, %d obstacle ship(s)', scenario_data['name'],
+                     os.path.basename(args.static_map), scenario_entry['seed'], len(episode['dyn']))
+    else:
+        start_cell, goal_cell = (40, 5), (32, 42)
+        for cell in (start_cell, goal_cell):
+            if not (0 <= cell[0] < env_loaded.x_range and 0 <= cell[1] < env_loaded.y_range):
+                parser.error('The ship start {} and goal {} are fixed for 50x50 maps and do not fit '
+                             'the {}x{} map {}; use the GUI (python -m crowd_nav.gui) to place them'
+                             .format(start_cell, goal_cell, env_loaded.x_range, env_loaded.y_range,
+                                     args.static_map))
+        planner = ThetaStar(start=start_cell, goal=goal_cell, env=env_loaded_safety_dist)
+        cost, path, expand = planner.plan()
+        if not path:
+            logging.error('No route for the ship on %s, check its start and goal', args.static_map)
+            return
     robot_route = env_loaded.grid_2_drl(path)[::-1]   # start first
     env_config = configparser.RawConfigParser()
     env_config.read(env_config_file)
     env = gym.make('CrowdSimTest-v0')
     env.configure(env_config, args)
+    env.time_limit = args.max_steps * env.time_step
     if args.square:
         env.test_sim = 'square_crossing'
     if args.circle:
@@ -154,28 +195,32 @@ def main():
 
     policy.set_env(env)
     robot.print_info()
-    local_goal_dist, monitor_dist = 1, 5
-    dym_obs_list = build_dynamic_obstacles(env_loaded_safety_dist, DYNAMIC_OBSTACLES,
-                                           robot_route, seed=args.test_case or 0)
+    if scenario_entry is not None:
+        dym_obs_list = episode['dyn']
+    else:
+        dym_obs_list = build_dynamic_obstacles(env_loaded_safety_dist, DYNAMIC_OBSTACLES,
+                                               robot_route, seed=args.test_case or 0)
     ob = env.reset(args.phase, args.test_case, dym_obs_list)
     path_dense = interpolate_path(env.global_path)[1:]
-
-    one_goal = get_local_goal(robot.get_full_state(), ob, path_dense, local_goal_dist, monitor_dist)
-    robot.gx, robot.gy = one_goal[0], one_goal[1]
-    cnt_idx, cnt_max = 0, 2000
-    info = None  # outcome of the episode: set below, either by env.step() or the iteration cap
-    while not math.dist((robot.px, robot.py), path_dense[-1])<robot.radius:
-        ob = env.light_reset(args.phase, args.test_case)  # re-observe: dynamic humans + nearby static cells
-        action = robot.act(ob)  # SARL: score all 81 candidate actions, pick the best
-        ob, _, done, info = env.step(action)  # advance the world by one time_step; done=True on collision/timeout/reach-goal
+    tracker = LocalGoalTracker.from_env(
+        env, path_dense, goal_dist=args.local_goal_dist, monitor_dist=args.monitor_dist,
+        monitor_exit=args.monitor_exit_dist, lookahead_rate=args.lookahead_rate,
+        shore_clearance=args.shore_clearance)
+    robot.gx, robot.gy = tracker.update(robot.get_full_state(), ob)
+    info = None
+    emergency_steps = 0
+    for _ in range(args.max_steps):
+        ob = env.light_reset(args.phase, args.test_case)
+        action = robot.act(ob)
+        emergency_steps += bool(getattr(policy, 'emergency', False))
+        ob, _, done, info = env.step(action)
         if done:
-            break  # stop right away instead of continuing and overwriting info on the next tick
-        one_goal = get_local_goal(robot.get_full_state(), ob, path_dense, local_goal_dist, monitor_dist)
-        robot.gx, robot.gy = one_goal[0], one_goal[1]  # slide the local goal forward along the path
-        cnt_idx += 1
-        if cnt_idx>=cnt_max:
-            info = Timeout()  # ran out of control-loop iterations, distinct from env's own time_limit-based Timeout
             break
+        robot.gx, robot.gy = tracker.update(robot.get_full_state(), ob)
+    else:
+        info = Timeout()
+    if hasattr(policy, 'emergency'):
+        logging.info('Emergency fallback used in %d of %d steps', emergency_steps, len(env.states))
 
     if args.visualize:
         if args.traj:
@@ -184,7 +229,7 @@ def main():
             env.render('video', args.video_file)
 
         logging.info('It takes %.2f seconds to finish. Final status is %s', env.global_time, info)
-        if robot.visible and info == 'reach goal':
+        if robot.visible and isinstance(info, ReachGoal):
             human_times = env.get_human_times()
             logging.info('Average time for humans to reach goal: %.2f', sum(human_times) / len(human_times))
     else:
