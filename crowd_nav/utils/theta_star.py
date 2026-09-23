@@ -798,33 +798,6 @@ class ThetaStar(AStar):
         
         return True
 
-def get_local_goal(ship_state, obstacle_states, dense_path, goal_dist=2.0, monitor_dist=5.0):
-    num_points = len(dense_path)
-    ship_pos = (ship_state.px, ship_state.py)
-
-    obst_monitored_states, obst_monitored_dist = [], []
-    for one_obst_state in obstacle_states:
-        if abs(one_obst_state.vx) + abs(one_obst_state.vy) < 1e-10:
-                continue
-        
-        obst_pos = (one_obst_state.px, one_obst_state.py)
-        obst_dist = math.dist(obst_pos, ship_pos)
-
-        if obst_dist >= monitor_dist:
-            continue
-        
-        obst_monitored_states.append(one_obst_state)
-        obst_monitored_dist.append(obst_dist)
-
-    distances = [math.dist(ship_pos, pt) for pt in dense_path]
-    nearest_idx = np.argmin(distances)
-    look_ahead_dist = monitor_dist if len(obst_monitored_states)>0 else goal_dist
-    for i in range(nearest_idx, num_points):
-        if math.dist(ship_pos, dense_path[i]) >= look_ahead_dist:
-            return dense_path[i]
-        
-    return dense_path[-1]
-
 def interpolate_path(path, step_size=0.2):
     new_path = []
     for i in range(len(path) - 1):
