@@ -90,6 +90,11 @@ def build_env(env_config, args, policy, sim_grid):
     env.set_robot(robot)
     env.set_obstacles(sim_grid.get_static_obstacles())
     env.set_init_para(sim_grid.get_env_para())
+    # Optional override of the land sensing radius (--nearby_dist); the map supplies 5 m.
+    # getattr keeps callers that build their own args object working unchanged.
+    nearby_dist = getattr(args, 'nearby_dist', None)
+    if nearby_dist is not None:
+        env.nearby_dist = nearby_dist
     policy.set_env(env)
     return env, robot
 
@@ -231,6 +236,10 @@ def main():
     parser.add_argument('--lookahead_rate', type=float, default=1.0, help='m/s the look-ahead may change')
     parser.add_argument('--shore_clearance', type=float, default=0.5,
                         help='room between the ship-to-goal segment and the land, on top of the radius')
+    parser.add_argument('--nearby_dist', type=float, default=None,
+                        help='land sensing radius in m: how far away land cells are still given to '
+                             'the policy as agents (default: the map value of 5). 0 keeps land out '
+                             'of the observation entirely; collision checking is unaffected')
     parser.add_argument('--max_steps', type=int, default=500)  # 500 * 0.25s = 125s per episode
     parser.add_argument('--safety_distance', type=int, default=1)
     parser.add_argument('--min_route_len', type=float, default=20.0)
