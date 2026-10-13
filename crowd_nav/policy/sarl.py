@@ -106,6 +106,8 @@ class SARL(MultiHumanRL):
         self.safety_margin_dynamic = 0.2
         self.braking_check = True
         self.safety_horizon = 3.0
+        # land margin in force for the step being predicted, see coast_margin()
+        self.step_static_margin = None
         # diagnostics of the last prediction
         self.candidates = None
         self.safe_mask = None
@@ -214,6 +216,25 @@ class SARL(MultiHumanRL):
 
     # -- safety filter --------------------------------------------------------
 
+    COAST_SLACK = 0.01  # m a ship inside the land margin may close its gap by per step
+
+    def coast_margin(self, nav):
+        """Land margin for a step that starts at ``nav``.
+
+        Every candidate is swept from the current position, so a ship that is
+        already closer to land than ``safety_margin_static`` fails the check
+        whatever it does and stays in the emergency fallback, where the value
+        network is never consulted. Inside the margin the ship's own gap is
+        used instead: holding or opening it passes, closing it does not.
+        """
+        gap = static_clearance(nav.position, nav.position, nav.radius,
+                               getattr(self.env, 'land_rects', ()), getattr(self.env, 'map_bounds', None))
+        return max(0.0, min(self.safety_margin_static, gap - self.COAST_SLACK))
+
+    def land_margin(self):
+        """The land margin in force: the step's own while predicting, else the configured one."""
+        return self.safety_margin_static if self.step_static_margin is None else self.step_static_margin
+
     def braking_clearance(self, nav, humans):
         """Worst margin-adjusted gap while stopping from ``nav`` at ``max_decel``.
 
@@ -252,7 +273,7 @@ class SARL(MultiHumanRL):
             # The heading is held, so the braking path is one straight segment and a
             # single sweep finds the same land gap as sweeping every substep.
             clearance = min(clearance, static_clearance(braking_start, position, nav.radius, rects,
-                                                        bounds) - self.safety_margin_static)
+                                                        bounds) - self.land_margin())
         remaining = self.safety_horizon - elapsed
         if remaining > 0:
             for start, move, radius in others:
@@ -265,7 +286,7 @@ class SARL(MultiHumanRL):
         """Sweep one candidate over the next step (and the braking after it)."""
         next_nav = advance(nav, action, self.time_step)
         reward, done, info = self.env.assess_motion(nav, next_nav, humans, next_humans)
-        clearance = min(info.min_sep_static - self.safety_margin_static,
+        clearance = min(info.min_sep_static - self.land_margin(),
                         info.min_sep_dynamic - self.safety_margin_dynamic)
         if self.braking_check and not done:
             clearance = min(clearance, self.braking_clearance(next_nav, next_humans))
@@ -294,7 +315,7 @@ class SARL(MultiHumanRL):
         held = (start[0] + vx * horizon, start[1] + vy * horizon)
         clearance = static_clearance(start, (start[0] + vx, start[1] + vy), nav.radius,
                                      getattr(self.env, 'land_rects', ()),
-                                     getattr(self.env, 'map_bounds', None)) - self.safety_margin_static
+                                     getattr(self.env, 'map_bounds', None)) - self.land_margin()
         for other in others:
             end = (other.px + other.vx * horizon, other.py + other.vy * horizon)
             clearance = min(clearance, circle_clearance(start, held, nav.radius, other.position, end,
@@ -335,7 +356,14 @@ class SARL(MultiHumanRL):
         if self.phase == 'train' and self.epsilon is None:
             raise AttributeError('Epsilon attribute has to be set in training phase')
         self.emergency = False
+        self.step_static_margin = self.coast_margin(state.self_state)
+        try:
+            return self.select_action(state)
+        finally:
+            self.step_static_margin = None
 
+    def select_action(self, state):
+        """The body of ``predict``, run with the step's land margin in force."""
         nav = state.self_state
         humans, next_humans = self.env.predict_humans(state, self.query_env)
         actions = self.candidate_actions(nav)

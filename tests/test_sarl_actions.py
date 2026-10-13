@@ -335,3 +335,21 @@ def test_braking_land_check_matches_sweeping_every_substep(make_env, make_sarl):
             position, speed = end, next_speed
         got = policy.braking_clearance(nav, [])
         assert got == pytest.approx(expected, abs=1e-9)
+
+
+def test_ship_inside_the_land_margin_may_hold_or_open_its_gap(make_env, make_sarl):
+    # land from x = 6.0 and the robot 0.1 m from it, inside the 0.2 m margin:
+    # every sweep starts too close, so before the coast margin nothing passed
+    env = make_env(obstacles=[dict(cx=6.5, cy=5, w=1, h=1)])
+    policy = make_sarl(env)
+    env.robot.set(5.6, 5, 18, 5, 0, 0, 0)
+    away, towards, along, stop = ActionXY(-0.5, 0), ActionXY(0.5, 0), ActionXY(0, 0.5), ActionXY(0, 0)
+    policy.action_space = [away, towards, along, stop]
+    action = env.robot.act(env.observe_at(env.robot.get_position()))
+    assert not policy.emergency
+    assert policy.safe_mask == [True, False, True, True], 'closing the gap still fails'
+    assert action != towards
+    assert policy.step_static_margin is None, 'the step margin does not outlive predict'
+    # with room to spare the configured margin applies unchanged
+    env.robot.set(3.0, 5, 18, 5, 0, 0, 0)
+    assert policy.coast_margin(env.robot.get_full_state()) == policy.safety_margin_static
