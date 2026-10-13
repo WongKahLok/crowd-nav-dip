@@ -12,7 +12,7 @@ Order of preference, highest first:
 1. safe and rule-compliant (give-way duties; see ``breaks_rules``),
 2. safe (a rule is dropped when obeying it would leave nothing safe to do, which is
    how Rule 2 and Rule 17(b) are approximated: the rules never require a collision),
-3. the constrained deceleration SARL falls back on when nothing is safe.
+3. the evasive action SARL falls back on when nothing is safe.
 
 ``rule_yielded`` counts the steps that fell to level 2 and ``rule_filtered`` the
 candidates removed at level 1, so the cost of the rules can be reported.

@@ -275,19 +275,41 @@ class SARL(MultiHumanRL):
         return Candidate(index, action, next_nav, reward, done, info, clearance, safe, speed, change,
                          turn)
 
-    def emergency_action(self, nav, candidates):
-        """Least dangerous constrained deceleration when no candidate is safe.
+    def held_clearance(self, nav, candidate, others):
+        """Worst margin-adjusted gap if the candidate's velocity is held, not braked.
 
-        Only non-accelerating candidates are considered, so the answer is a
-        braking manoeuvre; a ship that is already at rest may move off instead.
-        Stopping is not assumed safe: every option is ranked by the same swept
-        clearance, so an oncoming ship makes the ship dodge rather than wait.
+        The braking check assumes the ship stops after the step, which is the
+        wrong model when another ship does not give way: braking in its path
+        only lets it arrive. Here the candidate velocity is held for
+        ``safety_horizon`` seconds against the extrapolated ships. Land is
+        checked one second ahead only, since the ship can still turn from it.
         """
-        speed = math.hypot(nav.vx, nav.vy)
-        pool = candidates
-        if speed >= self.stop_speed:
-            pool = [c for c in candidates if c.speed <= speed + 1e-9] or candidates
-        return max(pool, key=lambda c: (c.clearance, -c.speed, -c.velocity_change)).action
+        horizon = self.safety_horizon
+        start = candidate.next_nav.position
+        vx, vy = candidate.next_nav.vx, candidate.next_nav.vy
+        held = (start[0] + vx * horizon, start[1] + vy * horizon)
+        clearance = static_clearance(start, (start[0] + vx, start[1] + vy), nav.radius,
+                                     getattr(self.env, 'land_rects', ()),
+                                     getattr(self.env, 'map_bounds', None)) - self.safety_margin_static
+        for other in others:
+            end = (other.px + other.vx * horizon, other.py + other.vy * horizon)
+            clearance = min(clearance, circle_clearance(start, held, nav.radius, other.position, end,
+                                                        other.radius) - self.safety_margin_dynamic)
+        return clearance
+
+    def emergency_action(self, nav, candidates, others=()):
+        """Best evasive action when no candidate is safe.
+
+        An action that collides within the next step is never chosen while
+        another one does not. Among the rest the action that stays clearest
+        with its velocity held (see ``held_clearance``) wins, accelerating
+        ones included, so the ship dodges an oncoming ship instead of braking
+        in its path; ties go to the smallest change of velocity.
+        """
+        def rank(c):
+            return (not isinstance(c.info, Collision), self.held_clearance(nav, c, others),
+                    -c.velocity_change)
+        return max(candidates, key=rank).action
 
     # -- prediction -----------------------------------------------------------
 
@@ -295,8 +317,8 @@ class SARL(MultiHumanRL):
         """
         Score only the candidates that pass the swept safety check with the value
         network, charge ``continuity_weight`` per radian of heading change so
-        close scores keep the current course, and fall back to a constrained
-        deceleration when nothing is safe. The chosen action is executed exactly
+        close scores keep the current course, and fall back to the best evasive
+        action when nothing is safe. The chosen action is executed exactly
         as scored; nothing is smoothed afterwards.
 
         Reaching the goal in ``state`` (usually a local goal on the route) does
@@ -322,7 +344,7 @@ class SARL(MultiHumanRL):
         self.emergency = not safe
 
         if not safe:
-            action = self.emergency_action(nav, candidates)
+            action = self.emergency_action(nav, candidates, next_humans)
         elif self.phase == 'train' and np.random.random() < self.epsilon:
             action = safe[np.random.choice(len(safe))].action
         else:

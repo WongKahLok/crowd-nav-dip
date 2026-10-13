@@ -5,6 +5,7 @@ import pytest
 
 from crowd_sim.envs.utils.action import ActionRot, ActionXY
 from crowd_sim.envs.utils.human import Human
+from crowd_sim.envs.utils.info import Collision
 from crowd_sim.envs.utils.state import JointState
 
 from conftest import FixedPolicy
@@ -158,25 +159,38 @@ def test_braking_check_sees_moving_ships(make_env, make_sarl, env_cfg):
     assert not candidate.safe
 
 
-def test_emergency_fallback_decelerates_and_dodges_oncoming_ship(make_env, make_sarl, env_cfg):
+def emergency_candidates(policy, env, nav, ships):
+    humans, next_humans = env.predict_humans(JointState(nav, [s.get_observable_state() for s in ships]))
+    candidates = [policy.check_action(i, nav, a, humans, next_humans)
+                  for i, a in enumerate(policy.action_space)]
+    return [c._replace(safe=False) for c in candidates], next_humans
+
+
+def test_emergency_fallback_dodges_instead_of_braking(make_env, make_sarl, env_cfg):
     env = make_env()
     policy = make_sarl(env)
     policy.action_space = [ActionXY(1, 0), ActionXY(0.5, 0), ActionXY(0, 0), ActionXY(0.5, 0.5)]
     nav = moving(env.robot.get_full_state(), 0.8, 0.0)
-    humans, next_humans = [], []
-    candidates = [policy.check_action(i, nav, a, humans, next_humans)
-                  for i, a in enumerate(policy.action_space)]
-    # force everything unsafe with identical clearance: the slowest, straightest option wins
-    forced = [c._replace(safe=False, clearance=-1.0) for c in candidates]
-    assert policy.emergency_action(nav, forced) == ActionXY(0, 0)
-    # a dodge with more room beats stopping into an oncoming ship
-    forced[3] = forced[3]._replace(clearance=-0.2)
-    assert policy.emergency_action(nav, forced) == ActionXY(0.5, 0.5)
-    # accelerating options are never used while moving, even with the best clearance
-    forced[0] = forced[0]._replace(clearance=0.5)
-    assert policy.emergency_action(nav, forced) == ActionXY(0.5, 0.5)
-    # at rest every option is allowed
-    assert policy.emergency_action(moving(env.robot.get_full_state(), 0, 0), forced) == ActionXY(1, 0)
+    # a ship 3 m ahead coming straight at the robot: holding course and braking in
+    # its path both end in contact, turning away does not
+    oncoming = Human(env_cfg, 'humans')
+    oncoming.set(8.0, 5.0, 0, 5, -1, 0, 0)
+    forced, next_humans = emergency_candidates(policy, env, nav, [oncoming])
+    assert policy.emergency_action(nav, forced, next_humans) == ActionXY(0.5, 0.5)
+    held = [policy.held_clearance(nav, c, next_humans) for c in forced]
+    assert held[3] > held[2] and held[3] > held[0]
+
+    # an action that collides within this step loses to every one that does not,
+    # however much room it would have afterwards
+    forced[3] = forced[3]._replace(info=Collision(collision_kind='static'))
+    assert policy.emergency_action(nav, forced, next_humans) != ActionXY(0.5, 0.5)
+
+    # speeding up is allowed when it is what gets the ship clear: a ship crossing
+    # from starboard aims at where the slow options will be
+    crossing = Human(env_cfg, 'humans')
+    crossing.set(5.6, 3.0, 5.6, 9, 0, 1, 0)
+    forced, next_humans = emergency_candidates(policy, env, nav, [crossing])
+    assert policy.emergency_action(nav, forced, next_humans) == ActionXY(1, 0)
 
     # end to end: a ship bearing down on the robot makes stopping unsafe
     oncoming = Human(env_cfg, 'humans')
@@ -191,12 +205,12 @@ def test_emergency_fallback_decelerates_and_dodges_oncoming_ship(make_env, make_
     action = env.robot.act(ob)
     assert policy.emergency
     assert action != ActionXY(0, 0), 'stopping is not assumed safe'
-    assert action.vx < 0, 'the ship backs away from the oncoming ship'
     nav = env.robot.get_full_state()
     humans, next_humans = env.predict_humans(JointState(nav, ob))
     stop = policy.check_action(0, nav, ActionXY(0, 0), humans, next_humans)
     chosen = policy.check_action(0, nav, action, humans, next_humans)
-    assert stop.clearance < chosen.clearance < 0
+    assert (policy.held_clearance(nav, stop, next_humans)
+            < policy.held_clearance(nav, chosen, next_humans))
 
 
 def test_continuity_cost_breaks_near_ties(make_env, make_sarl):
