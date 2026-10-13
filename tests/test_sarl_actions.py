@@ -310,3 +310,28 @@ def test_training_phase_explores_safe_candidates(make_env, make_sarl):
     for _ in range(10):
         assert env.robot.act(ob) != ActionXY(1, 0)
     assert policy.last_state is not None
+
+
+def test_braking_land_check_matches_sweeping_every_substep(make_env, make_sarl):
+    from crowd_sim.envs.utils.collision import static_clearance
+    env = make_env(obstacles=[dict(cx=x + 0.5, cy=y + 0.5, w=1, h=1)
+                              for x, y in [(7, 4), (7, 5), (3, 7), (8, 8), (2, 2)]])
+    policy = make_sarl(env)
+    rng = np.random.RandomState(0)
+    for _ in range(300):
+        nav = env.robot.get_full_state()
+        nav.px, nav.py = rng.uniform(1, 9, 2)
+        nav.position = (nav.px, nav.py)
+        moving(nav, *rng.uniform(-1, 1, 2))
+        # reference: the old per-substep sweep
+        dt, speed = policy.time_step, math.hypot(nav.vx, nav.vy)
+        heading, position = np.array((nav.vx, nav.vy)) / speed, np.array(nav.position)
+        expected = math.inf
+        while speed > 0:
+            next_speed = max(0.0, speed - policy.max_decel * dt)
+            end = position + heading * (speed + next_speed) / 2 * dt
+            expected = min(expected, static_clearance(position, end, nav.radius, env.land_rects,
+                                                      env.map_bounds) - policy.safety_margin_static)
+            position, speed = end, next_speed
+        got = policy.braking_clearance(nav, [])
+        assert got == pytest.approx(expected, abs=1e-9)

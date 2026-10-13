@@ -238,17 +238,21 @@ class SARL(MultiHumanRL):
                   for h in humans]
         clearance = math.inf
         elapsed = 0.0
+        braking_start = position
         while speed > 0:
             next_speed = max(0.0, speed - self.max_decel * dt)
             end = position + heading * (speed + next_speed) / 2 * dt
-            clearance = min(clearance, static_clearance(position, end, nav.radius, rects, bounds)
-                            - self.safety_margin_static)
             for k, (start, move, radius) in enumerate(others):
                 clearance = min(clearance, circle_clearance(position, end, nav.radius, start,
                                                             start + move, radius)
                                 - self.safety_margin_dynamic)
                 others[k] = (start + move, move, radius)
             position, speed, elapsed = end, next_speed, elapsed + dt
+        if elapsed > 0:
+            # The heading is held, so the braking path is one straight segment and a
+            # single sweep finds the same land gap as sweeping every substep.
+            clearance = min(clearance, static_clearance(braking_start, position, nav.radius, rects,
+                                                        bounds) - self.safety_margin_static)
         remaining = self.safety_horizon - elapsed
         if remaining > 0:
             for start, move, radius in others:
