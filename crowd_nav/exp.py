@@ -27,7 +27,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TABLE = os.path.join(REPO_ROOT, 'crowd_nav', 'experiments.txt')
 MODELS = os.path.join(REPO_ROOT, 'crowd_nav', 'data')
 RESULTS = os.path.join(REPO_ROOT, 'crowd_nav', 'results-v2')
-MAP_KEYS = ('sf', 'ht')
+MAP_KEYS = ('sf', 'ht', 'sg')
 if not __package__:  # started as a file: make the project importable
     sys.path.insert(0, REPO_ROOT)
 
@@ -64,18 +64,19 @@ def load_table(path=TABLE):
             if not fields:
                 continue
             where = '{} line {}'.format(os.path.relpath(path), number)
-            if len(fields) < 5:
-                raise Problem('{}: expected "name policy model sf-ships ht-ships [settings]"'
-                              .format(where))
-            name, policy, model, sf, ht = fields[:5]
+            if len(fields) < 3 + len(MAP_KEYS):
+                raise Problem('{}: expected "name policy model {} [settings]"'.format(
+                    where, ' '.join(m + '-ships' for m in MAP_KEYS)))
+            name, policy, model = fields[:3]
+            counts = fields[3:3 + len(MAP_KEYS)]
             if name in experiments:
                 raise Problem('{}: the experiment "{}" is listed twice'.format(where, name))
             try:
-                ships = {'sf': ship_counts(sf), 'ht': ship_counts(ht)}
+                ships = {m: ship_counts(c) for m, c in zip(MAP_KEYS, counts)}
             except ValueError:
                 raise Problem('{}: ship counts are comma separated numbers such as 4,8,12, or - '
                               'to leave a map out'.format(where))
-            experiments[name] = Experiment(name, policy, model, ships, fields[5:])
+            experiments[name] = Experiment(name, policy, model, ships, fields[3 + len(MAP_KEYS):])
     return experiments
 
 

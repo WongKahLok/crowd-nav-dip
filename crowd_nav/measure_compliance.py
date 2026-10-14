@@ -120,7 +120,7 @@ def times(violations, time_step=0.25):
     return ', '.join('{:.1f}-{:.1f}s'.format(a * time_step, b * time_step) for a, b in spans[:4])
 
 
-def measure(name, cfg, results, rules, maps=('sf', 'ht'), sample=25, ships=None, jobs=None):
+def measure(name, cfg, results, rules, maps=('sf', 'ht', 'sg'), sample=25, ships=None, jobs=None):
     """Replay trips of an experiment under the rule watch (``sample`` of them, 0 for all).
 
     Returns (measured, mismatched): a list of (map key, compliance row, violations), and

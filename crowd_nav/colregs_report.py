@@ -12,7 +12,7 @@ import json
 import os
 import textwrap
 
-MAPS = ('sf', 'ht')
+MAPS = ('sf', 'ht', 'sg')
 
 
 def short(map_name):

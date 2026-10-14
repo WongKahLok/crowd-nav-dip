@@ -6,14 +6,14 @@
 # Each experiment sails seeds 0-99 on every map listed, so two experiments always
 # face the same trips. A trip gives up after 500 steps (125 s).
 #
-# Columns: name, policy, model folder (in crowd_nav/data), ship counts on the SF map,
-# ship counts on the HT map ("-" leaves a map out), then settings.
+# Columns: name, policy, model folder (in crowd_nav/data), ship counts on the SF, HT
+# and SG maps ("-" leaves a map out), then settings.
 # Settings: --env_set section.key=value      changes env.config for this experiment only
 #           --policy_set section.key=value   the same for policy.config
 # Here the other ships can see ours (robot.visible=true).
 #
-# name           policy        model folder    SF ships  HT ships  settings
-sarl             sarl          output-trained  8         8         --env_set robot.visible=true
-colregs          sarl_colregs  output-trained  8         8         --env_set robot.visible=true
-sarl_dense       sarl          output-trained  12        16,24     --env_set robot.visible=true
-colregs_dense    sarl_colregs  output-trained  12        16,24     --env_set robot.visible=true
+# name           policy        model folder    SF ships  HT ships  SG ships  settings
+sarl             sarl          output-trained  8         8         8         --env_set robot.visible=true
+colregs          sarl_colregs  output-trained  8         8         8         --env_set robot.visible=true
+sarl_dense       sarl          output-trained  12        16,24     12        --env_set robot.visible=true
+colregs_dense    sarl_colregs  output-trained  12        16,24     12        --env_set robot.visible=true

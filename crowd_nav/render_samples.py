@@ -103,7 +103,7 @@ def parse_trip(text):
     return m, ships, seed
 
 
-def choose(name, results, maps=('sf', 'ht'), types=TYPES, per_type=1, ships=None, trips=None):
+def choose(name, results, maps=('sf', 'ht', 'sg'), types=TYPES, per_type=1, ships=None, trips=None):
     """The trips to film, as (kind, map key, ships, seed, CSV row or None)."""
     wanted = [parse_trip(t) for t in trips or ()]
     picks = []

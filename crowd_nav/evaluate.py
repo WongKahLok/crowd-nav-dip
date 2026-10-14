@@ -36,7 +36,8 @@ from crowd_sim.envs.utils.robot import Robot
 # this file is <repo>/crowd_nav/evaluate.py, so the repository root is two levels up
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAPS = {'sf': os.path.join(REPO_ROOT, 'static_maps', 'land_shapes_sf_crop.png'),
-        'ht': os.path.join(REPO_ROOT, 'static_maps', 'land_shapes_ht_crop.png')}
+        'ht': os.path.join(REPO_ROOT, 'static_maps', 'land_shapes_ht_crop.png'),
+        'sg': os.path.join(REPO_ROOT, 'static_maps', 'land_shapes_sg_crop.png')}
 
 
 def map_key(map_name):
