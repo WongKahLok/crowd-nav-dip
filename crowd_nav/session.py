@@ -82,7 +82,7 @@ class ScenarioSession(object):
             self.device = torch.device('cpu') if device is None else torch.device(device)
             policy = evaluate.build_policy(
                 SimpleNamespace(policy=policy_name, model_dir=model_dir,
-                                policy_config='policy.config', il=False),
+                                policy_config='policy.config', il=False, colregs=colregs),
                 self.device)
         else:
             self.device = device

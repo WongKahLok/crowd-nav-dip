@@ -7,6 +7,7 @@ import torch
 import numpy as np
 import gym
 from crowd_nav.utils.explorer import Explorer
+from crowd_nav.evaluate import policy_key
 from crowd_nav.policy.policy_factory import policy_factory
 from crowd_nav.utils.theta_star import HybridEnv, ThetaStar
 from crowd_nav.utils.theta_star import interpolate_path
@@ -84,7 +85,8 @@ def main():
     parser.add_argument('--circle', default=False, action='store_true')
     parser.add_argument('--video_file', type=str, default=None)
     parser.add_argument('--traj', default=False, action='store_true')
-    parser.add_argument('--colregs', default=False, action='store_true')
+    parser.add_argument('--colregs', default=False, action='store_true',
+                        help='sail by the COLREGs: --policy sarl becomes sarl_colregs')
     parser.add_argument('--static_map', type=str, default=None)
     parser.add_argument('--max_steps', type=int, default=2000)
     parser.add_argument('--local_goal_dist', type=float, default=1.0)
@@ -121,7 +123,7 @@ def main():
                         datefmt="%Y-%m-%d %H:%M:%S")
     device = torch.device("cuda:0" if torch.cuda.is_available() and args.gpu else "cpu")
     logging.info('Using device: %s', device)
-    policy = policy_factory[args.policy]()
+    policy = policy_factory[policy_key(args)]()   # --colregs makes sarl the rule-following sarl_colregs
     policy_config = configparser.RawConfigParser()
     policy_config.read(policy_config_file)
     policy.configure(policy_config)

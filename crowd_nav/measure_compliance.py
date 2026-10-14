@@ -1,119 +1,108 @@
-"""Measure COLREGs compliance of an arm that has already been evaluated.
+"""Scores the actions a ship actually took against the COLREGs rules.
 
-Replays episodes from <results>/<arm>_<map>.csv and feeds every executed action to
-``colregs.EncounterTracker``, which classifies the encounters with Rule 13(d) memory and
-scores the action taken in each one. Nothing about the policy changes: this is the
-"before" measurement that a COLREGs-aware policy has to beat.
+A ``RuleWatch`` looks on during every trip and gives each action to the encounter tracker
+of colregs.py. `exp run` keeps it on, so the compliance comes with the results. Plain SARL
+is scored the same way, which is what the rule filter is compared with.
 
-    ./crowd_nav/measure_compliance.sh b4_theta_sarl                  # 25 episodes per map
-    ./crowd_nav/measure_compliance.sh b4_theta_sarl --sample 0       # every episode (slow)
-    ./crowd_nav/measure_compliance.sh b4_theta_sarl --videos 3       # plus the worst 3 as mp4
-
-Writes one row per episode to <results>/compliance/<arm>_<map>.csv and prints the totals.
-Videos go to <results>/videos/<arm>-compliance/ with the violation times in the caption.
+One row per trip goes to <results>/compliance/<name>_<map>.csv.
 """
-import argparse
-import configparser
 import csv
-import logging
+import functools
 import os
+from collections import namedtuple
 
-import numpy as np
-import torch
-
-from crowd_nav.evaluate import (build_env, build_grids, build_policy, free_cells,
-                                run_episode, sample_scenario)
+from crowd_nav.evaluate import MAPS, map_key, read_config, run_trips
 from crowd_nav.policy import colregs
-from crowd_nav.render_samples import MAPS, render
+from crowd_nav.policy.sarl_colregs import rule_thresholds
 from crowd_sim.envs.utils.action import ActionXY
 
 KINDS = [colregs.HEAD_ON, colregs.CROSSING, colregs.OVERTAKING, colregs.OVERTAKEN]
+# our duty in an encounter; the filter only enforces give way
+ROLES = [colregs.GIVE_WAY, colregs.STAND_ON]
 FIELDS = (['map', 'seed', 'ships', 'outcome', 'steps', 'encounters', 'compliant_encounters',
            'compliance_rate', 'violating_steps', 'encounter_steps', 'stopped_steps']
-          + ['{}_encounters'.format(k) for k in KINDS] + ['{}_compliant'.format(k) for k in KINDS])
+          + ['{}_encounters'.format(k) for k in KINDS] + ['{}_compliant'.format(k) for k in KINDS]
+          + ['{}_encounters'.format(r) for r in ROLES] + ['{}_compliant'.format(r) for r in ROLES])
+
+# what another ship is to ours in one frame: kind of encounter, our role, rule broken or not
+Mark = namedtuple('Mark', 'kind role broken')
 
 
-def parse_args():
-    ap = argparse.ArgumentParser(description='COLREGs compliance of an evaluated arm')
-    ap.add_argument('--arm', required=True)
-    ap.add_argument('--results', default='crowd_nav/results-v2')
-    ap.add_argument('--maps', nargs='+', default=['sf', 'ht'], choices=sorted(MAPS))
-    ap.add_argument('--sample', type=int, default=25, help='episodes per map, 0 for all')
-    ap.add_argument('--ships', type=int, nargs='+', default=None, help='only these densities')
-    ap.add_argument('--videos', type=int, default=0, help='render this many of the worst episodes')
-    # rule thresholds, all of them interpretations that belong in the report
-    ap.add_argument('--safe_cpa', type=float, default=1.0, help='closest approach that counts as clear, m')
-    ap.add_argument('--max_range', type=float, default=15.0, help='ignore vessels beyond this, m')
-    ap.add_argument('--max_tcpa', type=float, default=30.0, help='ignore approaches further off than this, s')
-    ap.add_argument('--clear_range', type=float, default=colregs.CLEAR_RANGE,
-                    help='an encounter ends beyond this range while opening, m')
-    # the settings of the run being replayed; they must match it
-    ap.add_argument('--env_config', type=str, default='configs/env.config')
-    ap.add_argument('--policy_config', type=str, default='configs/policy.config')
-    ap.add_argument('--policy', type=str, default='sarl')
-    ap.add_argument('--model_dir', type=str, default='crowd_nav/data/output-trained')
-    ap.add_argument('--il', default=False, action='store_true')
-    ap.add_argument('--gpu', default=False, action='store_true')
-    ap.add_argument('--colregs', default=False, action='store_true')
-    ap.add_argument('--no_global_plan', default=False, action='store_true')
-    ap.add_argument('--local_goal_dist', type=float, default=1.0)
-    ap.add_argument('--monitor_dist', type=float, default=5.0)
-    ap.add_argument('--monitor_exit_dist', type=float, default=None)
-    ap.add_argument('--lookahead_rate', type=float, default=1.0)
-    ap.add_argument('--shore_clearance', type=float, default=0.5)
-    ap.add_argument('--max_steps', type=int, default=500)
-    ap.add_argument('--safety_distance', type=int, default=1)
-    ap.add_argument('--nearby_dist', type=float, default=None)
-    ap.add_argument('--min_route_len', type=float, default=20.0)
-    return ap.parse_args()
+def rule_settings(cfg, **given):
+    """The thresholds to score with: the experiment's own, unless given explicitly."""
+    rules = rule_thresholds(read_config(cfg, 'policy'))
+    rules.update({key: value for key, value in given.items() if value is not None})
+    return rules
+
+
+class RuleWatch(object):
+    """An ``on_step`` callback that scores every executed action against the rules.
+
+    ``frames[k]`` holds {ship index: Mark} for frame k (the videos colour ships with it);
+    ``violations`` lists the steps that broke a rule.
+    """
+
+    def __init__(self, env, robot, rules):
+        self.env = env
+        self.robot = robot
+        self.tracker = colregs.EncounterTracker(
+            clear_range=rules['clear_range'], safe_cpa=rules['safe_cpa'],
+            min_turn=rules['min_turn'], max_range=rules['max_range'], max_tcpa=rules['max_tcpa'])
+        self.frames = []
+        self.violations = []
+
+    def __call__(self, steps, _max_steps):
+        own, ships = self.env.states[-1][0], self.env.states[-1][1]  # the state the action was chosen in
+        action = ActionXY(self.robot.vx, self.robot.vy)              # holonomic: velocity is the action
+        marks = {}
+        for key, encounter in self.tracker.update(own, ships, action=action).items():
+            broken = self.tracker.breaks(action, encounter, own, ships[key])
+            if broken:
+                self.violations.append((steps, encounter.kind, encounter.role))
+            marks[key] = Mark(encounter.kind, encounter.role, broken)
+        self.frames.append(marks)
+
+    def record(self, row):
+        """The compliance row of the trip whose metrics row is ``row``."""
+        summary = self.tracker.summary()
+        record = {
+            'map': row['map'], 'seed': row['seed'], 'ships': row['requested_n_dynamic'],
+            'outcome': row['outcome'], 'steps': row['steps'],
+            'encounters': summary['encounters'], 'compliant_encounters': summary['compliant'],
+            'compliance_rate': ('' if summary['compliance_rate'] is None
+                                else round(summary['compliance_rate'], 4)),
+            'violating_steps': summary['violating_steps'], 'encounter_steps': summary['steps'],
+            'stopped_steps': summary['stopped_steps'],
+        }
+        for table, names in (('by_kind', KINDS), ('by_role', ROLES)):
+            for name in names:
+                entry = summary[table].get(name, {'encounters': 0, 'compliant': 0})
+                record['{}_encounters'.format(name)] = entry['encounters']
+                record['{}_compliant'.format(name)] = entry['compliant']
+        return record
+
+
+def watch_trip(runner, trip, rules):
+    """Sail one trip under the rule watch; returns (metrics row, the watch)."""
+    map_path, ships, seed = trip
+    env, robot = runner.stage(map_path)[:2]
+    watch = RuleWatch(env, robot, rules)
+    return runner.run(map_path, ships, seed, on_step=watch), watch
+
+
+def measure_trip(runner, trip, rules):
+    """The task ``run_trips`` gives its workers: (metrics row, compliance row, violations)."""
+    row, watch = watch_trip(runner, trip, rules)
+    return row, watch.record(row), watch.violations
 
 
 def spread(rows, sample):
-    """Take `sample` rows spread evenly over the arm, so every density is represented."""
+    """Take `sample` rows spread evenly over the experiment, so every density is represented."""
     rows = sorted(rows, key=lambda r: (int(r['requested_n_dynamic']), int(r['seed'])))
     if not sample or sample >= len(rows):
         return rows
     step = len(rows) / float(sample)
     return [rows[int(i * step)] for i in range(sample)]
-
-
-def watch(env, robot, tracker, violations):
-    """An on_step callback that scores the action just executed against the rules."""
-    def on_step(steps, _max_steps):
-        own, ships = env.states[-1][0], env.states[-1][1]   # the state the action was chosen in
-        action = ActionXY(robot.vx, robot.vy)               # holonomic: velocity is the action
-        for key, encounter in tracker.update(own, ships, action=action).items():
-            if colregs.violates(action, encounter, own, ships[key], safe_cpa=tracker.safe_cpa):
-                violations.append((steps, encounter.kind, encounter.role))
-    return on_step
-
-
-def measure(env, robot, sim_grid, plan_grid, cells, row, args):
-    """Replay one episode and return its compliance row plus the violating steps."""
-    seed, ships = int(row['seed']), int(row['requested_n_dynamic'])
-    np.random.seed(seed)
-    scenario = sample_scenario(plan_grid, cells, ships, args.min_route_len)
-    tracker = colregs.EncounterTracker(clear_range=args.clear_range, safe_cpa=args.safe_cpa,
-                                       max_range=args.max_range, max_tcpa=args.max_tcpa)
-    violations = []
-    result = run_episode(env, robot, sim_grid, scenario, args,
-                         on_step=watch(env, robot, tracker, violations))
-    summary = tracker.summary()
-    record = {
-        'map': row['map'], 'seed': seed, 'ships': ships, 'outcome': result['outcome'],
-        'steps': result['steps'], 'encounters': summary['encounters'],
-        'compliant_encounters': summary['compliant'],
-        'compliance_rate': ('' if summary['compliance_rate'] is None
-                            else round(summary['compliance_rate'], 4)),
-        'violating_steps': summary['violating_steps'], 'encounter_steps': summary['steps'],
-        'stopped_steps': summary['stopped_steps'],
-    }
-    for kind in KINDS:
-        entry = summary['by_kind'].get(kind, {'encounters': 0, 'compliant': 0})
-        record['{}_encounters'.format(kind)] = entry['encounters']
-        record['{}_compliant'.format(kind)] = entry['compliant']
-    matched = result['outcome'] == row['outcome'] and str(result['steps']) == row['steps']
-    return record, violations, matched
 
 
 def times(violations, time_step=0.25):
@@ -131,92 +120,102 @@ def times(violations, time_step=0.25):
     return ', '.join('{:.1f}-{:.1f}s'.format(a * time_step, b * time_step) for a, b in spans[:4])
 
 
-def main():
-    args = parse_args()
-    logging.basicConfig(level=logging.WARNING)
-    torch.set_num_threads(1)
-    env_config = configparser.RawConfigParser()
-    env_config.read(os.path.join(args.model_dir, os.path.basename(args.env_config)))
-    policy = build_policy(args, torch.device('cpu'))
-    out_dir = os.path.join(args.results, 'compliance')
-    os.makedirs(out_dir, exist_ok=True)
+def measure(name, cfg, results, rules, maps=('sf', 'ht'), sample=25, ships=None, jobs=None):
+    """Replay trips of an experiment under the rule watch (``sample`` of them, 0 for all).
 
-    everything, mismatched = [], 0
-    for m in args.maps:
-        csv_path = os.path.join(args.results, '{}_{}.csv'.format(args.arm, m))
+    Returns (measured, mismatched): a list of (map key, compliance row, violations), and
+    how many replays did not match their CSV row. Nothing is written; see :func:`save`.
+    """
+    chosen = []
+    for m in maps:
+        csv_path = os.path.join(results, '{}_{}.csv'.format(name, m))
         if not os.path.exists(csv_path):
             print('{}: {} not found, skipped'.format(m.upper(), csv_path))
             continue
         with open(csv_path, newline='') as fh:
             rows = [r for r in csv.DictReader(fh) if r['outcome'] != 'scenario_failed']
-        if args.ships:
-            rows = [r for r in rows if int(r['requested_n_dynamic']) in args.ships]
-        rows = spread(rows, args.sample)
-        print('{}: replaying {} episodes'.format(m.upper(), len(rows)))
+        if ships:
+            rows = [r for r in rows if int(r['requested_n_dynamic']) in ships]
+        rows = spread(rows, sample)
+        print('{}: replaying {} trips'.format(m.upper(), len(rows)))
+        chosen += [(m, r) for r in rows]
+    if not chosen:
+        return [], 0
 
-        sim_grid, plan_grid = build_grids(MAPS[m], args.safety_distance)
-        cells = free_cells(plan_grid)
-        env, robot = build_env(env_config, args, policy, sim_grid)
-        measured = []
-        for i, row in enumerate(rows, 1):
-            record, violations, matched = measure(env, robot, sim_grid, plan_grid, cells, row, args)
-            mismatched += not matched
-            measured.append((record, violations))
-            print('  [{:3d}/{}] seed {:3d}, {} ships: {:2d} encounters, {:2d} violated, {}'.format(
-                i, len(rows), record['seed'], record['ships'], record['encounters'],
-                record['encounters'] - record['compliant_encounters'],
-                'clean' if not violations else times(violations)))
+    def show(done, total, result):
+        _, record, violations = result
+        print('  [{:3d}/{}] {} seed {:3d}, {:2d} ships: {:2d} encounters, {:2d} violated, {}'.format(
+            done, total, map_key(record['map']).upper(), record['seed'], record['ships'],
+            record['encounters'], record['encounters'] - record['compliant_encounters'],
+            'clean' if not violations else times(violations)), flush=True)
 
-        with open(os.path.join(out_dir, '{}_{}.csv'.format(args.arm, m)), 'w', newline='') as fh:
+    trips = [(MAPS[m], int(r['requested_n_dynamic']), int(r['seed'])) for m, r in chosen]
+    replays = run_trips(cfg, trips, jobs=jobs, on_result=show,
+                        task=functools.partial(measure_trip, rules=rules))
+    measured, mismatched = [], 0
+    for (m, stored), (row, record, violations) in zip(chosen, replays):
+        mismatched += not (row['outcome'] == stored['outcome']
+                           and str(row['steps']) == stored['steps'])
+        measured.append((m, record, violations))
+    return measured, mismatched
+
+
+def compliance_path(results, name, m):
+    return os.path.join(results, 'compliance', '{}_{}.csv'.format(name, m))
+
+
+def checked(results, name, m):
+    """How many trips of one map the rule check on file covers (0 when there is none)."""
+    path = compliance_path(results, name, m)
+    if not os.path.exists(path):
+        return 0
+    with open(path, newline='') as fh:
+        return sum(1 for _ in csv.DictReader(fh))
+
+
+def save(name, results, measured):
+    """Write <results>/compliance/<name>_<map>.csv from (map key, compliance row, ...) items."""
+    os.makedirs(os.path.join(results, 'compliance'), exist_ok=True)
+    for m in sorted({item[0] for item in measured}):
+        with open(compliance_path(results, name, m), 'w', newline='') as fh:
             writer = csv.DictWriter(fh, fieldnames=FIELDS)
             writer.writeheader()
-            for record, _ in measured:
-                writer.writerow(record)
-        everything += [(m, record, violations) for record, violations in measured]
+            writer.writerows(item[1] for item in measured if item[0] == m)
 
-        if args.videos:
-            worst = sorted(measured, key=lambda rv: (-len(rv[1]), -rv[0]['encounters']))[:args.videos]
-            video_dir = os.path.join(args.results, 'videos', args.arm + '-compliance')
-            os.makedirs(video_dir, exist_ok=True)
-            for record, violations in worst:
-                if not record['encounters']:
-                    continue
-                np.random.seed(record['seed'])
-                scenario = sample_scenario(plan_grid, cells, record['ships'], args.min_route_len)
-                run_episode(env, robot, sim_grid, scenario, args)
-                path = os.path.join(video_dir, '{}_{}ships_seed{}.mp4'.format(
-                    m, record['ships'], record['seed']))
-                caption = '{} | {} | {} ships | seed {} | {} of {} encounters violated'.format(
-                    args.arm, m.upper(), record['ships'], record['seed'],
-                    record['encounters'] - record['compliant_encounters'], record['encounters'])
-                if violations:
-                    caption += ' | breaches at ' + times(violations)
-                render(env, path, caption)
-                print('  wrote {}'.format(path))
 
-    if not everything:
+def totals(records):
+    """Encounters and how many were complied with, overall and per kind of encounter."""
+    total = lambda field: sum(int(r[field] or 0) for r in records)
+    return {
+        'trips': len(records),
+        'trips_with_encounters': sum(1 for r in records if int(r['encounters'] or 0)),
+        'encounters': total('encounters'), 'compliant': total('compliant_encounters'),
+        'encounter_steps': total('encounter_steps'), 'violating_steps': total('violating_steps'),
+        'stopped_steps': total('stopped_steps'),
+        'by_kind': {kind: (total('{}_encounters'.format(kind)), total('{}_compliant'.format(kind)))
+                    for kind in KINDS},
+        'by_role': {role: (total('{}_encounters'.format(role)), total('{}_compliant'.format(role)))
+                    for role in ROLES},
+    }
+
+
+def report(name, measured, mismatched=0):
+    """Print the totals of a rule check."""
+    if not measured:
         return
-    total = lambda field: sum(r[field] for _, r, _ in everything)
-    encounters, compliant = total('encounters'), total('compliant_encounters')
-    print('\n=== {} : COLREGs compliance over {} episodes ==='.format(args.arm, len(everything)))
-    print('episodes with at least one encounter: {} of {}'.format(
-        sum(1 for _, r, _ in everything if r['encounters']), len(everything)))
+    t = totals([record for _, record, _ in measured])
+    print('\n=== {} : COLREGs compliance over {} trips ==='.format(name, t['trips']))
+    print('trips with at least one encounter: {} of {}'.format(t['trips_with_encounters'], t['trips']))
     print('encounters: {}  compliant: {}  compliance rate: {}'.format(
-        encounters, compliant,
-        '{:.1%}'.format(compliant / encounters) if encounters else 'n/a (no encounters)'))
+        t['encounters'], t['compliant'],
+        '{:.1%}'.format(t['compliant'] / t['encounters']) if t['encounters'] else 'n/a (no encounters)'))
     print('steps inside an encounter: {}  violating: {}  stopped: {}'.format(
-        total('encounter_steps'), total('violating_steps'), total('stopped_steps')))
-    print('\n{:12s} {:>11s} {:>10s} {:>7s}'.format('rule', 'encounters', 'compliant', 'rate'))
-    for kind in KINDS:
-        n = total('{}_encounters'.format(kind))
-        ok = total('{}_compliant'.format(kind))
-        print('{:12s} {:11d} {:10d} {:>7s}'.format(
-            kind, n, ok, '{:.0%}'.format(ok / n) if n else '-'))
-    print('\nper-episode rows in {}'.format(out_dir))
+        t['encounter_steps'], t['violating_steps'], t['stopped_steps']))
+    for title, table, names in (('rule', 'by_kind', KINDS), ('our duty', 'by_role', ROLES)):
+        print('\n{:12s} {:>11s} {:>10s} {:>7s}'.format(title, 'encounters', 'compliant', 'rate'))
+        for name in names:
+            n, ok = t[table][name]
+            print('{:12s} {:11d} {:10d} {:>7s}'.format(name, n, ok, '{:.0%}'.format(ok / n) if n else '-'))
     if mismatched:
-        print('WARNING: {} replay(s) did not match the CSV; are the settings the same as the '
-              'run?'.format(mismatched))
-
-
-if __name__ == '__main__':
-    main()
+        print('WARNING: {} replay(s) did not match the CSV, so the settings in the experiments '
+              'table are not the ones the run used.'.format(mismatched))

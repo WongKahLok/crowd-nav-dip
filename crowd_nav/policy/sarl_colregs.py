@@ -1,41 +1,45 @@
-"""SARL with the COLREGs steering rules applied at action-selection time.
+"""SARL with the COLREGs rules applied when an action is chosen.
 
-The value network is untouched: this policy only narrows the set of actions it is
-allowed to choose from. SARL already builds kinematically reachable candidates and
-drops the ones that fail the swept safety check; this subclass drops, in addition,
-the ones that would break the rule in force for any vessel currently in an encounter
-(``crowd_nav.policy.colregs``). The value network then picks the best of what is left,
-so nothing has to be retrained.
+The value network is untouched. SARL already drops the candidate actions that fail its
+safety check; this policy also drops the ones that break the rule in force, and the
+network ranks what is left. If nothing is both safe and rule-following, the rule gives
+way and SARL chooses among the safe ones. Nothing is retrained.
 
-Order of preference, highest first:
-
-1. safe and rule-compliant (give-way duties; see ``breaks_rules``),
-2. safe (a rule is dropped when obeying it would leave nothing safe to do, which is
-   how Rule 2 and Rule 17(b) are approximated: the rules never require a collision),
-3. the constrained deceleration SARL falls back on when nothing is safe.
-
-``rule_yielded`` counts the steps that fell to level 2 and ``rule_filtered`` the
-candidates removed at level 1, so the cost of the rules can be reported.
-
-Thresholds come from an optional ``[colregs]`` section of policy.config; the defaults
-match crowd_nav.policy.colregs, and a config without that section works unchanged.
+Thresholds can be set in a [colregs] section of policy.config; without it the defaults
+below are used.
 """
 import logging
 
 from crowd_nav.policy import colregs
 from crowd_nav.policy.sarl import SARL
 
+THRESHOLDS = {'safe_cpa': 1.0,                    # closest approach that counts as clear, m
+              'max_range': 10.0,                  # ships further away are not a risk yet, m
+              'max_tcpa': 20.0,                   # nor are approaches further off than this, s
+              'clear_range': colregs.CLEAR_RANGE,  # an encounter ends beyond this while opening, m
+              'min_turn': 5.0}                    # a smaller turn does not count as a turn, deg
+
+
+def rule_thresholds(config=None):
+    """The thresholds of a policy config: its [colregs] section over the defaults.
+
+    The compliance check uses the same values, so what is measured is what was enforced.
+    """
+    if config is None:
+        return dict(THRESHOLDS)
+    return {key: config.getfloat('colregs', key, fallback=value)
+            for key, value in THRESHOLDS.items()}
+
 
 class SARLColregs(SARL):
     def __init__(self):
         super().__init__()
         self.name = 'SARL-COLREGs'
-        # rule thresholds, all interpretations of the convention's wording
-        self.safe_cpa = 1.0
-        self.max_range = 10.0
-        self.max_tcpa = 20.0
-        self.clear_range = colregs.CLEAR_RANGE
-        self.min_turn = 5.0
+        self.safe_cpa = THRESHOLDS['safe_cpa']
+        self.max_range = THRESHOLDS['max_range']
+        self.max_tcpa = THRESHOLDS['max_tcpa']
+        self.clear_range = THRESHOLDS['clear_range']
+        self.min_turn = THRESHOLDS['min_turn']
         self.enforce_stand_on = False
         # per-episode state and diagnostics
         self.tracker = None
@@ -48,11 +52,8 @@ class SARLColregs(SARL):
 
     def configure(self, config):
         super().configure(config)
-        self.safe_cpa = config.getfloat('colregs', 'safe_cpa', fallback=self.safe_cpa)
-        self.max_range = config.getfloat('colregs', 'max_range', fallback=self.max_range)
-        self.max_tcpa = config.getfloat('colregs', 'max_tcpa', fallback=self.max_tcpa)
-        self.clear_range = config.getfloat('colregs', 'clear_range', fallback=self.clear_range)
-        self.min_turn = config.getfloat('colregs', 'min_turn', fallback=self.min_turn)
+        for key, value in rule_thresholds(config).items():
+            setattr(self, key, value)
         self.enforce_stand_on = config.getboolean('colregs', 'enforce_stand_on',
                                                   fallback=self.enforce_stand_on)
         self.name = 'SARL-COLREGs'
@@ -74,19 +75,17 @@ class SARLColregs(SARL):
         if self.tracker is None or now is None or now <= self._last_time:
             self.tracker = self.new_tracker()
         self._last_time = -1.0 if now is None else now
-        # Land cells are not vessels: they carry no heading and no right of way.
+        # land cells are not ships
         self.targets = [h for h in state.human_states if not getattr(h, 'is_static', False)]
         return self.tracker.update(state.self_state, self.targets)
 
     def breaks_rules(self, nav, action):
-        """True when this action would break a rule that is being enforced.
+        """True when this action breaks the rule being enforced.
 
-        Only the give-way duties (Rules 13, 14, 15 and 16) are enforced by default.
-        Rule 17 tells a stand-on vessel to hold course and speed, but this geometry
-        cannot tell a turn made to follow the planned route from one made to avoid
-        the other vessel, and in a channel the two are constantly confused: enforcing
-        it stopped the ship from following its own route. Stand-on compliance is still
-        measured, and ``enforce_stand_on`` turns enforcement on for a comparison run.
+        Only give-way duties (Rules 13 to 16) are enforced. Stand-on (Rule 17) is measured
+        but not enforced: a turn to follow the route looks like a turn to avoid a ship,
+        and enforcing it stopped the ship following its route. ``enforce_stand_on`` turns
+        it on.
         """
         duty = self.enforced_duty()
         if duty is None:
@@ -96,13 +95,10 @@ class SARLColregs(SARL):
                                 safe_cpa=self.safe_cpa, min_turn=self.min_turn)
 
     def enforced_duty(self):
-        """The single encounter whose rule is enforced this step, or None.
+        """The one encounter whose rule is enforced this step, or None.
 
-        Enforcing every encounter at once over-constrains the ship: in a channel
-        several vessels are in sight at the same time and their duties conflict, so
-        nothing is left that is both safe and compliant. Seamanship deals with the
-        closest quarters first, so the duty enforced is the one with the least time
-        to closest approach. The others are still measured.
+        Several duties at once can leave no action, so only the most urgent one (least
+        time to closest approach) is enforced. The others are still measured.
         """
         duties = [(key, e) for key, e in self.encounters.items()
                   if self.enforce_stand_on or e.role == colregs.GIVE_WAY]

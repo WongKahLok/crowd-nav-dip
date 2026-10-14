@@ -753,7 +753,8 @@ def main(argv=None):
                             os.path.relpath(DEFAULT_MODEL_DIR, REPO_ROOT)))
     parser.add_argument('--map', default=None, help='map PNG to load at startup')
     parser.add_argument('--gpu', default=False, action='store_true')
-    parser.add_argument('--colregs', default=False, action='store_true')
+    parser.add_argument('--colregs', default=False, action='store_true',
+                        help='sail by the COLREGs: SARL with the rule filter (sarl_colregs)')
     parser.add_argument('--safety_distance', type=int, default=1)
     args = parser.parse_args(argv)
 

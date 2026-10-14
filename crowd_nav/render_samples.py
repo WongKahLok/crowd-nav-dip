@@ -1,78 +1,54 @@
-"""Render example episodes of an evaluated arm as mp4 videos, one per kind of outcome.
+"""Videos of trips: the trips asked for, or one of each kind of outcome of an experiment.
 
-Reads <results>/<arm>_<map>.csv (written by run_arm.sh), picks representative episodes,
-replays each one with the same settings and saves a video. Episodes replay exactly:
-the seed fixes the scenario and every policy is deterministic in the test phase. Each
-replay is checked against its CSV row (outcome and step count) before it is rendered,
-so a video always shows the episode that was measured.
+    python -m crowd_nav.exp video colregs ht:8:60 sf:8:36            # these trips (map:ships:seed)
+    python -m crowd_nav.exp video colregs                            # one trip of each kind
+    python -m crowd_nav.exp video colregs --types collision_dynamic timeout --per_type 3
+    python -m crowd_nav.exp video colregs --dry_run                  # list the picks only
 
-Normally called through render_arm.sh with the same settings as the run:
+A trip replays exactly (the seed fixes the scenario and the policies are deterministic).
+When the experiment has been run, the replay is checked against its CSV row before it is
+filmed, so a video shows the trip that was measured.
 
-    POLICY=orca ./crowd_nav/render_arm.sh b3_theta_orca
-    ./crowd_nav/render_arm.sh b4_theta_sarl --dry_run          # list the picks only
-    ./crowd_nav/render_arm.sh b4_theta_sarl --types collision_dynamic --per_type 3
-    ./crowd_nav/render_arm.sh b4_theta_sarl --episodes ht:16:2 ht:16:6   # chosen episodes
+The scene is marked with the rules: a ship we must give way to is ringed in red, a ship we
+stand on for in green, the rule in force is written under the clock, and our ship is
+ringed in red while it breaks one.
 
-Kinds of episode (--types):
+Kinds of trip (--types):
     success_typical    success whose duration is closest to the median success
     success_closest    success with the smallest gap to a moving ship (near miss)
     longest_detour     success with the largest travelled / planned distance
-    most_fallback      episode where the emergency fallback acted most (SARL only)
+    most_fallback      trip where the emergency fallback acted most (SARL only)
     collision_dynamic  hit a moving ship
     collision_static   hit land or the map edge
     collision_both     hit both within one step
     timeout            ran out of time
 """
-import argparse
-import configparser
 import csv
-import logging
 import os
 import statistics
 
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
+from matplotlib import animation, patches
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 
-from crowd_nav.evaluate import (build_env, build_grids, build_policy, free_cells,
-                                run_episode, sample_scenario)
+from crowd_nav.evaluate import MAPS, SettingsError
+from crowd_nav.measure_compliance import watch_trip
+from crowd_nav.policy import colregs
+from crowd_sim.envs.render import ROBOT_COLOR, EpisodeAnimation, save_animation
 
-MAPS = {'sf': 'static_maps/land_shapes_sf_crop.png', 'ht': 'static_maps/land_shapes_ht_crop.png'}
 TYPES = ['success_typical', 'success_closest', 'longest_detour', 'most_fallback',
          'collision_dynamic', 'collision_static', 'collision_both', 'timeout']
 
-
-def parse_args():
-    ap = argparse.ArgumentParser(description='Render example episodes of an evaluated arm')
-    ap.add_argument('--arm', required=True, help='arm name given to run_arm.sh')
-    ap.add_argument('--results', default='crowd_nav/results-v2', help='folder holding the arm CSVs')
-    ap.add_argument('--videos', default=None, help='output folder (default <results>/videos/<arm>)')
-    ap.add_argument('--types', nargs='+', default=TYPES, choices=TYPES)
-    ap.add_argument('--per_type', type=int, default=1, help='episodes per kind per map')
-    ap.add_argument('--maps', nargs='+', default=['sf', 'ht'], choices=sorted(MAPS))
-    ap.add_argument('--ships', type=int, nargs='+', default=None, help='only these requested densities')
-    ap.add_argument('--episodes', nargs='+', default=None, metavar='MAP:SHIPS:SEED',
-                    help='render exactly these episodes instead of one per kind, e.g. ht:16:2 sf:8:36')
-    ap.add_argument('--dry_run', action='store_true', help='list the chosen episodes without rendering')
-    # the same settings evaluate.py takes; they must match the run
-    ap.add_argument('--env_config', type=str, default='configs/env.config')
-    ap.add_argument('--policy_config', type=str, default='configs/policy.config')
-    ap.add_argument('--policy', type=str, default='sarl')
-    ap.add_argument('--model_dir', type=str, default='crowd_nav/data/output-trained')
-    ap.add_argument('--il', default=False, action='store_true')
-    ap.add_argument('--gpu', default=False, action='store_true')
-    ap.add_argument('--colregs', default=False, action='store_true')
-    ap.add_argument('--no_global_plan', default=False, action='store_true')
-    ap.add_argument('--local_goal_dist', type=float, default=1.0)
-    ap.add_argument('--monitor_dist', type=float, default=5.0)
-    ap.add_argument('--monitor_exit_dist', type=float, default=None)
-    ap.add_argument('--lookahead_rate', type=float, default=1.0)
-    ap.add_argument('--shore_clearance', type=float, default=0.5)
-    ap.add_argument('--max_steps', type=int, default=500)
-    ap.add_argument('--safety_distance', type=int, default=1)
-    ap.add_argument('--nearby_dist', type=float, default=None)
-    ap.add_argument('--min_route_len', type=float, default=20.0)
-    return ap.parse_args()
+GIVE_WAY_COLOR = '#d62728'   # we have to keep out of this ship's way
+STAND_ON_COLOR = '#2ca02c'   # this ship has to keep out of ours
+TRAIL_COLOR = '#b8860b'
+RING_RADIUS = 1.2            # ships are 0.3 m on a 50 m map: a ring makes the marked ones findable
+RULES = {(colregs.HEAD_ON, colregs.GIVE_WAY): 'Head-on, Rule 14: alter to starboard',
+         (colregs.CROSSING, colregs.GIVE_WAY): 'Crossing, Rule 15: give way',
+         (colregs.CROSSING, colregs.STAND_ON): 'Crossing, Rule 17: stand on',
+         (colregs.OVERTAKING, colregs.GIVE_WAY): 'Overtaking, Rule 13: keep clear',
+         (colregs.OVERTAKEN, colregs.STAND_ON): 'Being overtaken, Rule 17: stand on'}
 
 
 def num(row, field):
@@ -83,7 +59,7 @@ def num(row, field):
 
 
 def pick(rows, kind, n, taken):
-    """Up to n episodes of one kind, skipping episodes another kind already took."""
+    """Up to n trips of one kind, skipping trips another kind already took."""
     done = [r for r in rows if r['outcome'] == 'success']
     if kind == 'success_typical':
         if not done:
@@ -114,98 +90,175 @@ def pick(rows, kind, n, taken):
     return chosen
 
 
-def render(env, path, title):
-    """env.render('video') with a caption: the figure it creates gets a title."""
-    original = plt.subplots
-    if len(title) > 72:                       # keep a long caption inside the frame
-        parts = title.split(' | ')
-        half = max(len(parts) // 2, 1)
-        title = ' | '.join(parts[:half]) + '\n' + ' | '.join(parts[half:])
-
-    def titled(*args, **kwargs):
-        fig, ax = original(*args, **kwargs)
-        fig.suptitle(title, fontsize=10)
-        return fig, ax
-
-    plt.subplots = titled
+def parse_trip(text):
+    """'ht:8:60' -> ('ht', 8, 60)."""
+    parts = text.split(':')
     try:
-        env.render('video', path)
-    finally:
-        plt.subplots = original
-        plt.close('all')
+        m, ships, seed = parts[0], int(parts[1]), int(parts[2])
+        if len(parts) != 3 or m not in MAPS or ships < 0:
+            raise ValueError
+    except (IndexError, ValueError):
+        raise SettingsError('Cannot read the trip "{}": write it as map:ships:seed, for example '
+                            'ht:8:60 (maps: {})'.format(text, ', '.join(sorted(MAPS))))
+    return m, ships, seed
 
 
-def main():
-    args = parse_args()
-    logging.basicConfig(level=logging.WARNING)
-    torch.set_num_threads(1)  # match run_arm.sh so replays are bit-identical
-    device = torch.device('cpu')
-    out_dir = args.videos or os.path.join(args.results, 'videos', args.arm)
-
-    env_config = configparser.RawConfigParser()
-    env_config.read(os.path.join(args.model_dir, os.path.basename(args.env_config)))
-    policy = build_policy(args, device)
-
-    rendered, mismatched = [], []
-    for m in args.maps:
-        csv_path = os.path.join(args.results, '{}_{}.csv'.format(args.arm, m))
-        if not os.path.exists(csv_path):
-            print('{}: {} not found, skipped'.format(m.upper(), csv_path))
-            continue
-        with open(csv_path, newline='') as fh:
-            rows = [r for r in csv.DictReader(fh) if r['outcome'] != 'scenario_failed']
-        if args.ships:
-            rows = [r for r in rows if int(r['requested_n_dynamic']) in args.ships]
-        taken, picks = set(), []
-        print('{}: {} episodes in {}'.format(m.upper(), len(rows), csv_path))
-        if args.episodes:
-            wanted = [e.split(':') for e in args.episodes if e.split(':')[0] == m]
-            for _, ships, seed in wanted:
-                match = [r for r in rows if r['requested_n_dynamic'] == ships and int(r['seed']) == int(seed)]
-                if not match:
-                    print('  {} ships, seed {}: not in this arm'.format(ships, seed))
-                picks += [('episode', r) for r in match]
+def choose(name, results, maps=('sf', 'ht'), types=TYPES, per_type=1, ships=None, trips=None):
+    """The trips to film, as (kind, map key, ships, seed, CSV row or None)."""
+    wanted = [parse_trip(t) for t in trips or ()]
+    picks = []
+    for m in maps:
+        csv_path = os.path.join(results, '{}_{}.csv'.format(name, m))
+        rows = []
+        if os.path.exists(csv_path):
+            with open(csv_path, newline='') as fh:
+                rows = [r for r in csv.DictReader(fh) if r['outcome'] != 'scenario_failed']
+        chosen = []
+        if wanted:
+            for _, n, seed in (t for t in wanted if t[0] == m):
+                match = [r for r in rows if int(r['requested_n_dynamic']) == n and int(r['seed']) == seed]
+                chosen.append(('episode', m, n, seed, match[0] if match else None))
+        elif not rows:
+            print('{}: no results in {} yet. Run the experiment first, or name the trips to '
+                  'film.'.format(m.upper(), csv_path))
         else:
-            for kind in args.types:
-                chosen = pick(rows, kind, args.per_type, taken)
-                if not chosen:
-                    print('  {:18s} none in this arm'.format(kind))
-                picks += [(kind, r) for r in chosen]
-        for kind, r in picks:
-            print('  {:18s} {:>2s} ships, seed {:3d}: {} after {} steps'.format(
-                kind, r['requested_n_dynamic'], int(r['seed']), r['outcome'], r['steps']))
-        if args.dry_run or not picks:
+            if ships:
+                rows = [r for r in rows if int(r['requested_n_dynamic']) in ships]
+            taken = set()
+            print('{}: {} trips in {}'.format(m.upper(), len(rows), csv_path))
+            for kind in types:
+                found = pick(rows, kind, per_type, taken)
+                if not found:
+                    print('  {:18s} none in this experiment'.format(kind))
+                chosen += [(kind, m, int(r['requested_n_dynamic']), int(r['seed']), r) for r in found]
+        for kind, _, n, seed, stored in chosen:
+            print('  {:18s} {} {:2d} ships, seed {:3d}: {}'.format(
+                kind, m.upper(), n, seed,
+                '{} after {} steps'.format(stored['outcome'], stored['steps']) if stored
+                else 'not in the results, filmed without a check'))
+        picks += chosen
+    return picks
+
+
+# -- drawing ------------------------------------------------------------------------
+
+class RuleMarks(object):
+    """The COLREGs situation drawn over one scene, from the frames of a ``RuleWatch``."""
+
+    def __init__(self, scene, frames):
+        self.scene = scene
+        self.frames = frames
+        ax = scene.ax
+        xs, ys = zip(*scene.robot_positions)
+        self.track = (xs, ys)
+        self.trail, = ax.plot([], [], color=TRAIL_COLOR, linewidth=1.5, zorder=1)
+        self.rings = [patches.Circle((0, 0), RING_RADIUS, fill=False, linewidth=2, visible=False)
+                      for _ in scene.humans]
+        self.own_ring = patches.Circle((0, 0), RING_RADIUS, fill=False, linewidth=2,
+                                       color=GIVE_WAY_COLOR, linestyle=':', visible=False)
+        for ring in self.rings + [self.own_ring]:
+            ax.add_artist(ring)
+        env = scene.env
+        self.text = ax.text(env.env_x_min + 1, env.env_y_max - 4.5, '', fontsize=11, va='top',
+                            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+        ring = lambda color: Line2D([], [], marker='o', linestyle='None', markersize=9,
+                                    markerfacecolor='none', markeredgewidth=2, color=color)
+        ship = lambda color: Line2D([], [], marker='o', linestyle='None', markersize=7, color=color)
+        ax.legend([ship(ROBOT_COLOR), ship('b'), ring(GIVE_WAY_COLOR), ring(STAND_ON_COLOR)],
+                  ['Our ship', 'Other ships', 'We give way', 'We stand on'],
+                  fontsize=10, loc='upper right')
+
+    def update(self, k):
+        self.trail.set_data(self.track[0][:k + 1], self.track[1][:k + 1])
+        marks = self.frames[k] if k < len(self.frames) else {}
+        for i, ring in enumerate(self.rings):
+            mark = marks.get(i)
+            ring.set_visible(mark is not None)
+            if mark is not None:
+                ring.center = self.scene.human_positions[k][i]
+                ring.set_edgecolor(GIVE_WAY_COLOR if mark.role == colregs.GIVE_WAY else STAND_ON_COLOR)
+        broken = any(mark.broken for mark in marks.values())
+        self.own_ring.set_visible(broken)
+        self.own_ring.center = self.scene.robot_positions[k]
+        lines = sorted({RULES[mark.kind, mark.role] + (' - BROKEN' if mark.broken else '')
+                        for mark in marks.values()})
+        self.text.set_text('\n'.join(lines[:4]))
+        self.text.set_color(GIVE_WAY_COLOR if broken else 'black')
+
+
+def wrap(title, width=72):
+    """Keep a long caption inside the frame by breaking it at a separator."""
+    if len(title) <= width:
+        return title
+    parts = title.split(' | ')
+    half = max(len(parts) // 2, 1)
+    return ' | '.join(parts[:half]) + '\n' + ' | '.join(parts[half:])
+
+
+def film(panels, path, fps=8):
+    """Write one video with a panel per (env, title, frames); returns the path written.
+
+    Each env holds the trip it sailed last. ``frames`` are a ``RuleWatch``'s, or None for
+    a plain scene. Panels play side by side on the same clock and a trip that ends first
+    holds its last frame, which is what makes two policies comparable at a glance.
+    """
+    figure = Figure(figsize=(7 * len(panels), 7.3))
+    FigureCanvasAgg(figure)
+    scenes = []
+    for i, (env, title, frames) in enumerate(panels, 1):
+        ax = figure.add_subplot(1, len(panels), i)
+        scene = EpisodeAnimation(env, ax)
+        ax.set_title(wrap(title), fontsize=10)
+        scenes.append((scene, RuleMarks(scene, frames) if frames is not None else None))
+    figure.tight_layout()
+
+    def update(k):
+        for scene, marks in scenes:
+            last = min(k, scene.frames - 1)
+            scene.update(last)
+            if marks is not None:
+                marks.update(last)
+
+    anim = animation.FuncAnimation(figure, update, frames=max(scene.frames for scene, _ in scenes),
+                                   interval=panels[0][0].time_step * 1000, repeat=False)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    return save_animation(anim, path, fps=fps)
+
+
+def caption(name, m, ships, seed, row, watch):
+    """What a video says above its scene: the trip, how it ended, how the rules fared."""
+    placed = row['n_dynamic']   # a map that is full takes fewer ships than were asked for
+    text = '{} | {} | {} ships | seed {} | {} after {:.2f} s'.format(
+        name, m.upper(), ships if placed == ships else '{} of {}'.format(placed, ships), seed,
+        row['outcome'], row['sim_time'])
+    summary = watch.tracker.summary()
+    if summary['encounters']:
+        text += ' | {} of {} encounters by the rules'.format(summary['compliant'], summary['encounters'])
+    else:
+        text += ' | no encounter'
+    return text
+
+
+def film_trips(runner, name, picks, out_dir, rules):
+    """Replay and film ``picks`` (from :func:`choose`). Returns (videos written, mismatches)."""
+    written, mismatched = [], []
+    for kind, m, ships, seed, stored in picks:
+        row, watch = watch_trip(runner, (MAPS[m], ships, seed), rules)
+        if row['outcome'] == 'scenario_failed':
+            print('  ! {} {} ships seed {}: no trip can be laid out for this seed'.format(
+                m.upper(), ships, seed))
             continue
-
-        sim_grid, plan_grid = build_grids(MAPS[m], args.safety_distance)
-        cells = free_cells(plan_grid)
-        env, robot = build_env(env_config, args, policy, sim_grid)
-        os.makedirs(out_dir, exist_ok=True)
-
-        for kind, r in picks:
-            seed, ships = int(r['seed']), int(r['requested_n_dynamic'])
-            np.random.seed(seed)  # the same scenario evaluate.py sampled
-            scenario = sample_scenario(plan_grid, cells, ships, args.min_route_len)
-            result = run_episode(env, robot, sim_grid, scenario, args)
-            if result['outcome'] != r['outcome'] or str(result['steps']) != r['steps']:
-                mismatched.append((m, kind, seed))
-                print('  ! {} seed {}: the replay gave {} after {} steps but the CSV says {} after {}. '
-                      'Not rendered: use the same POLICY, MODEL_DIR and flags as the run.'.format(
-                          kind, seed, result['outcome'], result['steps'], r['outcome'], r['steps']))
-                continue
-            path = os.path.join(out_dir, '{}_{}_{}ships_seed{}.mp4'.format(m, kind, ships, seed))
-            title = '{} | {} | {} ships | seed {} | {} after {:.2f} s'.format(
-                args.arm, m.upper(), ships, seed, r['outcome'], result['sim_time'])
-            render(env, path, title)
-            rendered.append(path)
-            print('  wrote {}'.format(path))
-
-    if not args.dry_run:
-        print('\n{} video(s) in {}'.format(len(rendered), out_dir))
-        if mismatched:
-            print('{} episode(s) did not replay identically and were skipped: {}'.format(
-                len(mismatched), mismatched))
-
-
-if __name__ == '__main__':
-    main()
+        if stored is not None and (row['outcome'] != stored['outcome']
+                                   or str(row['steps']) != stored['steps']):
+            mismatched.append((m, ships, seed))
+            print('  ! {} {} ships seed {}: the replay gave {} after {} steps but the CSV says {} '
+                  'after {}. Not filmed: the experiments table no longer holds the settings of '
+                  'that run.'.format(m.upper(), ships, seed, row['outcome'], row['steps'],
+                                     stored['outcome'], stored['steps']))
+            continue
+        path = os.path.join(out_dir, '{}_{}_{}ships_seed{}.mp4'.format(m, kind, ships, seed))
+        path = film([(runner.env(MAPS[m]), caption(name, m, ships, seed, row, watch), watch.frames)],
+                    path)
+        written.append(path)
+        print('  wrote {}'.format(path))
+    return written, mismatched

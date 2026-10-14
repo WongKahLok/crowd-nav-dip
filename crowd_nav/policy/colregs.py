@@ -1,38 +1,23 @@
 """COLREGs encounter classification and compliance checks (Rules 13, 14, 15).
 
-Pure geometry. This module imports nothing from the simulator, the policies or torch, so it
-can be unit tested with hand-written numbers and is unaffected by changes elsewhere in the
-stack. It answers two questions:
+Plain geometry, with no simulator, policy or torch imports, so it can be tested with
+hand-written numbers. It answers two questions:
 
-    classify_encounter(own, target) -> Encounter | None   what kind of encounter is this,
-                                                          and am I give-way or stand-on?
-    violates(action, encounter, own) -> bool              would this candidate action break
-                                                          the rule for that encounter?
+    classify_encounter(own, target)    what kind of encounter is this, and do I give way?
+    violates(action, encounter, ...)   would this action break the rule for that encounter?
 
-Conventions
------------
-* Bearings are degrees in the observing vessel's frame, positive to **starboard**
-  (clockwise), zero dead ahead, in (-180, 180].
-* "Heading" is taken from the velocity vector, because agents here are holonomic and other
-  ships expose only position and velocity. A vessel slower than ``STOPPED_SPEED`` has no
-  meaningful heading and is not classified.
+Bearings are in degrees in the observing ship's frame, positive to starboard. A ship's
+heading is taken from its velocity; a ship that is stopped has none and is not classified.
 
-``EncounterTracker`` adds the memory the rules require: Rule 13(d) says a vessel that is
-overtaking stays the overtaking vessel until finally past and clear, whatever the bearing
-does in the meantime, which a fresh per-step classification cannot express. The tracker
-also scores the actions actually taken, which is where a compliance rate comes from.
+EncounterTracker adds the memory of Rule 13(d), where an overtaking ship stays the
+overtaking ship until it is past and clear, and scores the actions actually taken.
 
-Simplifications (state these in the report)
--------------------------------------------
-* Risk of collision is approximated by closest point of approach (CPA), not by the full
-  Rule 7 assessment.
-* Rule 17 (stand-on) is treated as "hold course and speed"; the in-extremis clause, which
-  permits the stand-on vessel to act, is not modelled.
-* Rule 13 mandates keeping clear but no particular side, so an overtaking violation is
-  defined as leaving the predicted CPA below ``safe_cpa``.
-* Compliance is judged per step against the rule in force. "Ample time" and "readily
-  apparent" (Rule 8) are not modelled; an encounter counts as complied with when no
-  executed action broke its rule.
+Simplifications:
+* risk of collision is judged by closest point of approach (CPA) alone
+* the in-extremis clause of Rule 17 is not modelled
+* Rule 13 names no side, so overtaking is broken when the predicted CPA is under safe_cpa
+* "ample time" and "readily apparent" (Rule 8) are not modelled; an encounter counts as
+  complied with when no step in it broke its rule
 """
 import math
 from dataclasses import dataclass
@@ -89,11 +74,9 @@ def heading_of(state):
 
 
 def relative_bearing(observer, other, observer_heading):
-    """Bearing of `other` from `observer`, in the observer's frame, positive to starboard.
+    """Bearing of `other` from `observer`, positive to starboard.
 
-    Screen/maths convention: x right, y up, angles counter-clockwise. Turning starboard
-    (right) therefore *decreases* the mathematical angle, so the sign is negated to make
-    starboard positive, matching marine practice.
+    x is right and y is up, so turning right lowers the angle; the sign is flipped.
     """
     line_of_sight = math.degrees(math.atan2(other.py - observer.py, other.px - observer.px))
     return wrap180(-(line_of_sight - observer_heading))
@@ -117,15 +100,8 @@ def cpa(own, target):
 def classify_encounter(own, target, max_range=15.0, max_tcpa=30.0, safe_cpa=1.0):
     """Classify one encounter, or return None when no rule applies.
 
-    None is returned when the target is out of range, is not a risk (opening, or passing
-    wide), or when either vessel has no heading (stopped, e.g. a static land cell).
-
-    Args:
-        own: state with px, py, vx, vy (own ship)
-        target: state with px, py, vx, vy (the other vessel)
-        max_range: ignore targets further away than this, metres
-        max_tcpa: ignore encounters whose CPA is further off than this, seconds
-        safe_cpa: encounters passing wider than this are not a risk of collision, metres
+    None means the target is out of range (max_range, m), no risk (opening, CPA further
+    off than max_tcpa s, or passing wider than safe_cpa m), or one ship has no heading.
     """
     own_heading = heading_of(own)
     target_heading = heading_of(target)
@@ -169,11 +145,7 @@ def turn_direction(own_heading, action_heading):
 
 
 def crosses_ahead(own, target, vx, vy, horizon=None):
-    """True when this velocity takes own ship across the target's bow.
-
-    Evaluated at CPA: own ship is ahead of the target's beam if the bearing of own ship
-    from the target is within 90 degrees of the target's heading at that moment.
-    """
+    """True when this velocity takes own ship across the target's bow, judged at CPA."""
     target_heading = heading_of(target)
     if target_heading is None:
         return False
@@ -203,26 +175,13 @@ def keeps_clear(own, target, vx, vy, safe_cpa=1.0):
 def violates(action, encounter, own, target, min_turn=5.0, safe_cpa=1.0,
              stand_on_tolerance=15.0, min_speed_drop=MIN_SPEED_DROP,
              stand_on_speed_tolerance=STAND_ON_SPEED_TOLERANCE):
-    """True when `action` breaks the rule that applies to `encounter`.
+    """True when `action` (anything with vx, vy) breaks the rule of `encounter`.
 
-    A give-way action is judged by what it achieves as well as by how it looks. An
-    action that opens the predicted CPA to ``safe_cpa`` keeps the vessel clear
-    (Rule 16), so she does not have to keep altering once the manoeuvre has worked.
-    Slackening speed is a legitimate way to keep clear (Rule 8(e)) in every encounter
-    except a head-on, where Rule 14 names an alteration to starboard. Stopping carries
-    no exemption: it complies only where it actually keeps the vessel clear, and for a
-    stand-on vessel it breaks the duty to hold course *and speed*.
-
-    Args:
-        action: candidate action exposing vx, vy (ActionXY)
-        encounter: the Encounter returned by classify_encounter
-        own: own ship state (for its current heading, position and speed)
-        target: the other vessel's state
-        min_turn: an alteration smaller than this does not count as an alteration
-        safe_cpa: clearance that counts as keeping clear, metres
-        stand_on_tolerance: course change a stand-on vessel may make, degrees
-        min_speed_drop: fraction of speed that counts as slackening speed
-        stand_on_speed_tolerance: fraction a stand-on vessel may change speed by
+    A give-way action that opens the predicted CPA to safe_cpa counts as keeping clear.
+    Slowing down is allowed except in a head-on, where Rule 14 asks for a turn to
+    starboard. Stopping only complies where it keeps the ship clear, and it breaks a
+    stand-on ship's duty to hold course and speed. min_turn is the smallest turn that
+    counts as a turn, in degrees.
     """
     own_heading = heading_of(own)
     if own_heading is None or encounter is None:
@@ -319,21 +278,18 @@ class EncounterRecord:
 class EncounterTracker:
     """Classify encounters with memory, and score the actions taken during them.
 
-    Rule 13(d): a vessel that is overtaking stays the overtaking vessel until she is
-    finally past and clear, whatever the bearing does in the meantime. Classifying
-    afresh every step cannot express that, so an encounter here lives until the
-    vessels are opening and more than ``clear_range`` apart. The same memory stops
-    the give-way and stand-on roles of Rules 14 and 15 swapping while one encounter
-    is still being resolved.
+    An encounter lives until the ships are opening and more than ``clear_range`` apart, so
+    an overtaking ship stays overtaking (Rule 13(d)) and give-way and stand-on roles do
+    not swap while an encounter is being resolved.
 
-    Pass the executed action to ``update`` to score compliance; leave it out to
-    classify only. Targets are identified by position in ``targets`` unless ``keys``
-    is given, so a caller with stable vessel ids should pass them.
+    Pass the executed action to ``update`` to score it; leave it out to classify only.
+    Targets are told apart by their position in ``targets`` unless ``keys`` is given.
     """
 
-    def __init__(self, clear_range=CLEAR_RANGE, safe_cpa=1.0, **classify_kwargs):
+    def __init__(self, clear_range=CLEAR_RANGE, safe_cpa=1.0, min_turn=5.0, **classify_kwargs):
         self.clear_range = clear_range
         self.safe_cpa = safe_cpa
+        self.min_turn = min_turn
         self.classify_kwargs = dict(classify_kwargs, safe_cpa=safe_cpa)
         self.active = {}        # key -> Encounter currently in force
         self.open_records = {}  # key -> EncounterRecord being filled
@@ -388,8 +344,13 @@ class EncounterTracker:
         record.min_distance = min(record.min_distance, encounter.distance)
         if math.hypot(action.vx, action.vy) < STOPPED_SPEED:
             record.stopped_steps += 1
-        if violates(action, encounter, own, target, safe_cpa=self.safe_cpa):
+        if self.breaks(action, encounter, own, target):
             record.violations += 1
+
+    def breaks(self, action, encounter, own, target):
+        """`violates` with this tracker's thresholds, so every caller scores the same way."""
+        return violates(action, encounter, own, target, min_turn=self.min_turn,
+                        safe_cpa=self.safe_cpa)
 
     def _close(self, key):
         self.active.pop(key, None)
@@ -406,11 +367,12 @@ class EncounterTracker:
         """Compliance over all encounters. ``stopped_steps`` exposes waiting it out."""
         records = self.records()
         compliant = sum(r.compliant for r in records)
-        by_kind = {}
+        by_kind, by_role = {}, {}
         for r in records:
-            entry = by_kind.setdefault(r.kind, {'encounters': 0, 'compliant': 0})
-            entry['encounters'] += 1
-            entry['compliant'] += int(r.compliant)
+            for table, key in ((by_kind, r.kind), (by_role, r.role)):
+                entry = table.setdefault(key, {'encounters': 0, 'compliant': 0})
+                entry['encounters'] += 1
+                entry['compliant'] += int(r.compliant)
         return {
             'encounters': len(records),
             'compliant': compliant,
@@ -419,4 +381,5 @@ class EncounterTracker:
             'violating_steps': sum(r.violations for r in records),
             'stopped_steps': sum(r.stopped_steps for r in records),
             'by_kind': by_kind,
+            'by_role': by_role,
         }
