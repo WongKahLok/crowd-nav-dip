@@ -387,3 +387,67 @@ def test_colregs_emergency_follows_the_rules_when_it_costs_little(make_env, make
     policy.encounters = {}
     policy.emergency_tolerance = 1.0
     assert policy.emergency_action(nav, forced, next_humans) == port
+
+
+def colregs_with_duties(make_env, make_sarl, monkeypatch, breaks, duties):
+    """SARL-COLREGs on open water with stubbed encounters and a stubbed rule check.
+
+    ``duties`` maps a target key to its (role, tcpa); ``breaks`` maps an action to the
+    keys whose rule it breaks. Nothing else constrains the three candidates.
+    """
+    from crowd_nav.policy import colregs, sarl_colregs
+    from crowd_nav.policy.sarl_colregs import SARLColregs
+    env = make_env()
+    policy = make_sarl(env, cls=SARLColregs)
+    policy.action_space = list(breaks)
+    encounters = {key: colregs.Encounter(colregs.CROSSING, role, 45.0, -45.0, 5.0, 0.0, tcpa)
+                  for key, (role, tcpa) in duties.items()}
+
+    def update_encounters(state):
+        policy.targets = {key: None for key in encounters}
+        return dict(encounters)
+
+    monkeypatch.setattr(policy, 'update_encounters', update_encounters)
+    monkeypatch.setattr(sarl_colregs.colregs, 'violates',
+                        lambda action, encounter, *a, **k: next(
+                            key for key, e in encounters.items() if e is encounter) in breaks[action])
+    return policy, env
+
+
+def act(policy, env):
+    return env.robot.act(env.observe_at(env.robot.get_position()))
+
+
+def test_colregs_enforces_every_give_way_duty_at_once(make_env, make_sarl, monkeypatch):
+    from crowd_nav.policy import colregs
+    a, b, both = ActionXY(0.3, 0), ActionXY(0, 0.3), ActionXY(0.2, -0.2)
+    # `a` keeps ship 0's rule only, `b` ship 1's only, `both` keeps them all
+    policy, env = colregs_with_duties(
+        make_env, make_sarl, monkeypatch, {a: {1}, b: {0}, both: set()},
+        {0: (colregs.GIVE_WAY, 4.0), 1: (colregs.GIVE_WAY, 9.0), 2: (colregs.STAND_ON, 1.0)})
+    policy.encounters = policy.update_encounters(None)
+    assert [key for key, _ in policy.enforced_duties()] == [0, 1], 'give-way only, most urgent first'
+    assert act(policy, env) == both
+    assert not policy.emergency and policy.rule_relaxed == 0 and policy.rule_yielded == 0
+
+    # the old behaviour, for comparison runs: only the most urgent duty is enforced
+    policy.multi_duty = False
+    assert [key for key, _ in policy.enforced_duties()] == [0]
+    assert act(policy, env) in (a, both)
+
+
+def test_colregs_relaxes_the_least_urgent_duty_first(make_env, make_sarl, monkeypatch):
+    from crowd_nav.policy import colregs
+    a, b, neither = ActionXY(0.3, 0), ActionXY(0, 0.3), ActionXY(0.2, -0.2)
+    # no action keeps both rules; ship 0 is the closer in time, so its rule is kept
+    policy, env = colregs_with_duties(
+        make_env, make_sarl, monkeypatch, {a: {1}, b: {0}, neither: {0, 1}},
+        {0: (colregs.GIVE_WAY, 4.0), 1: (colregs.GIVE_WAY, 9.0)})
+    assert act(policy, env) == a
+    assert not policy.emergency and policy.rule_relaxed == 1 and policy.rule_yielded == 0
+
+    # when even the most urgent rule leaves nothing, the rules give way to safety
+    policy.action_space = [b, neither]
+    assert act(policy, env) in (b, neither)
+    assert not policy.emergency and policy.rule_relaxed == 1 and policy.rule_yielded == 1
+    assert policy._duties == [] and policy._apply_rules, 'no rule state leaks out of predict'
