@@ -554,6 +554,8 @@ class CrowdSim_test(TransitionMixin, gym.Env):
                     logging.warning('Dynamic obstacle %d has its %s %s on land, it will '
                                     'sail through the coast', idx, name, position)
             human = Human(self.config, 'humans')
+            if self.randomize_attributes:
+                human.sample_random_attributes()
             human.set(start[0], start[1], goal[0], goal[1], 0, 0, 0)
             self.humans.append(human)
             path = list(obst.get('path') or [])
