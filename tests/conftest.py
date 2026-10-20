@@ -83,12 +83,12 @@ def make_env(env_cfg):
 
 @pytest.fixture
 def make_sarl():
-    def build(env, query=False, weights=True, with_om=False):
+    def build(env, query=False, weights=True, with_om=False, cls=SARL):
         cfg = configparser.RawConfigParser()
         cfg.read(ROOT / 'crowd_nav/data/output-trained/policy.config')
         cfg.set('action_space', 'query_env', str(query))
         cfg.set('sarl', 'with_om', str(with_om))
-        policy = SARL()
+        policy = cls()
         policy.configure(cfg)
         if weights:
             state = torch.load(ROOT / 'crowd_nav/data/output-trained/rl_model.pth', map_location='cpu')

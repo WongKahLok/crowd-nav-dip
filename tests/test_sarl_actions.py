@@ -353,3 +353,37 @@ def test_ship_inside_the_land_margin_may_hold_or_open_its_gap(make_env, make_sar
     # with room to spare the configured margin applies unchanged
     env.robot.set(3.0, 5, 18, 5, 0, 0, 0)
     assert policy.coast_margin(env.robot.get_full_state()) == policy.safety_margin_static
+
+
+def test_colregs_emergency_follows_the_rules_when_it_costs_little(make_env, make_sarl, env_cfg):
+    from crowd_nav.policy import colregs
+    from crowd_nav.policy.sarl import SARL
+    from crowd_nav.policy.sarl_colregs import SARLColregs
+    env = make_env()
+    policy = make_sarl(env, cls=SARLColregs)
+    turn = math.radians(15)
+    port = ActionXY(0.8 * math.cos(turn), 0.8 * math.sin(turn))
+    starboard = ActionXY(0.8 * math.cos(turn), -0.8 * math.sin(turn))
+    policy.action_space = [port, starboard]
+    nav = moving(env.robot.get_full_state(), 0.8, 0.0)
+    # head-on, slightly to starboard, so turning to port leaves a little more room
+    oncoming = Human(env_cfg, 'humans')
+    oncoming.set(8.0, 4.97, 0, 5, -1, 0, 0)
+    forced, next_humans = emergency_candidates(policy, env, nav, [oncoming])
+    held = [policy.held_clearance(nav, c, next_humans) for c in forced]
+    assert held[0] > held[1], 'port has more room'
+    assert SARL.emergency_action(policy, nav, forced, next_humans) == port, 'plain SARL takes it'
+
+    policy.encounters = policy.update_encounters(JointState(nav, [oncoming.get_observable_state()]))
+    assert policy.urgent_encounter()[1].kind == colregs.HEAD_ON
+    policy._apply_rules = False                     # the pass whose action is executed
+    assert held[0] - held[1] < policy.emergency_tolerance
+    assert policy.emergency_action(nav, forced, next_humans) == starboard, 'Rule 14 within tolerance'
+    assert policy.rule_steered == 1
+    # more room than the tolerance is never given up for the rules
+    policy.emergency_tolerance = (held[0] - held[1]) / 2
+    assert policy.emergency_action(nav, forced, next_humans) == port
+    # without an encounter it is SARL's choice
+    policy.encounters = {}
+    policy.emergency_tolerance = 1.0
+    assert policy.emergency_action(nav, forced, next_humans) == port

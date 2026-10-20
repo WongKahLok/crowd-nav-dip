@@ -263,6 +263,49 @@ def violates(action, encounter, own, target, min_turn=5.0, safe_cpa=1.0,
     return False
 
 
+def emergency_preferred(action, encounter, own, target, min_turn=5.0, min_speed_drop=MIN_SPEED_DROP):
+    """True when `action` is the manoeuvre the rules favour once no option is safe.
+
+    ``violates`` judges the actions of a vessel that still has time. In an emergency
+    every option is already short of a safe passing distance, so this asks a looser
+    question: which way do the rules point, among moves that are about as safe?
+
+    * head-on (Rule 14): alter to starboard
+    * crossing, give-way (Rules 15, 16): do not cross ahead; alter to starboard or
+      slacken speed, never to port
+    * crossing, stand-on, in extremis (Rule 17(b), (c)): any action, but not an
+      alteration to port for a vessel on the own port side
+    * overtaking (Rule 13): drop back by slackening speed
+    * overtaken: do not slacken speed into the vessel coming up from astern
+
+    Slackening speed counts as a drop of ``min_speed_drop`` of the speed, a stop
+    included. With no heading (own vessel stopped) any action is accepted.
+    """
+    own_heading = heading_of(own)
+    if own_heading is None or encounter is None:
+        return True
+    own_speed = math.hypot(own.vx, own.vy)
+    speed = math.hypot(action.vx, action.vy)
+    moving = speed >= STOPPED_SPEED
+    turn = turn_direction(own_heading, math.degrees(math.atan2(action.vy, action.vx))) if moving else 0.0
+    starboard, port = turn >= min_turn, turn <= -min_turn
+    slackened = own_speed > 0 and speed <= own_speed * (1 - min_speed_drop)
+
+    if encounter.kind == HEAD_ON:
+        return moving and starboard
+    if encounter.kind == CROSSING and encounter.role == GIVE_WAY:
+        if port or (moving and crosses_ahead(own, target, action.vx, action.vy)):
+            return False
+        return starboard or slackened
+    if encounter.kind == CROSSING:
+        return not port
+    if encounter.kind == OVERTAKING:
+        return slackened
+    if encounter.kind == OVERTAKEN:
+        return not slackened
+    return True
+
+
 class _State:
     """Minimal state carrier so cpa() can be reused with a substituted velocity."""
     __slots__ = ('px', 'py', 'vx', 'vy')

@@ -8,7 +8,7 @@ import math
 
 from crowd_nav.policy.colregs import (CROSSING, GIVE_WAY, HEAD_ON, OVERTAKEN, OVERTAKING,
                                       STAND_ON, EncounterTracker, classify_encounter, cpa,
-                                      relative_bearing, violates, wrap180)
+                                      emergency_preferred, relative_bearing, violates, wrap180)
 
 
 class S:
@@ -147,6 +147,51 @@ def test_crossing_give_way_must_not_cross_ahead():
     assert not violates(A(0.7, -0.7), enc, own, target)
     # Sprinting straight ahead crosses its bow: violation.
     assert violates(A(1.0, 0.0), enc, own, target)
+
+
+def test_emergency_preference_head_on_is_a_starboard_turn():
+    own = S(0, 0, 1, 0)               # heading east, starboard is south (-y)
+    target = S(10, 0, -1, 0)
+    enc = classify_encounter(own, target)
+    assert emergency_preferred(A(0.7, -0.7), enc, own, target)
+    assert not emergency_preferred(A(0.7, 0.7), enc, own, target)    # port
+    assert not emergency_preferred(A(1.0, 0.0), enc, own, target)    # holding on
+    assert not emergency_preferred(A(0.0, 0.0), enc, own, target)    # stopping in its path
+
+
+def test_emergency_preference_crossing_give_way_passes_astern():
+    own = S(0, 0, 1, 0)
+    target = S(10, -10, 0, 1)         # from starboard, heading north
+    enc = classify_encounter(own, target)
+    assert emergency_preferred(A(0.7, -0.7), enc, own, target)      # starboard, astern of it
+    assert emergency_preferred(A(0.5, 0.0), enc, own, target)       # slowing lets it pass ahead
+    assert not emergency_preferred(A(1.0, 0.0), enc, own, target)   # crossing its bow
+    assert not emergency_preferred(A(0.7, 0.7), enc, own, target)   # port
+
+
+def test_emergency_preference_stand_on_in_extremis_avoids_port():
+    own = S(0, 0, 1, 0)
+    target = S(10, 10, 0, -1)         # from port, heading south: we stand on
+    enc = classify_encounter(own, target)
+    # Rule 17(b): the stand-on vessel may act, but 17(c): not to port for a vessel on its port side
+    assert emergency_preferred(A(0.7, -0.7), enc, own, target)
+    assert emergency_preferred(A(1.0, 0.0), enc, own, target)
+    assert not emergency_preferred(A(0.7, 0.7), enc, own, target)
+
+
+def test_emergency_preference_overtaking_drops_back_and_overtaken_does_not_brake():
+    own, slower = S(0, 0, 2, 0), S(6, 0, 1, 0)
+    enc = classify_encounter(own, slower)
+    assert enc.kind == OVERTAKING
+    assert emergency_preferred(A(1.5, 0.0), enc, own, slower)       # a 25% drop in speed
+    assert not emergency_preferred(A(2.0, 0.0), enc, own, slower)
+    own, faster = S(6, 0, 1, 0), S(0, 0, 2, 0)
+    enc = classify_encounter(own, faster)
+    assert enc.kind == OVERTAKEN
+    assert emergency_preferred(A(1.0, 0.0), enc, own, faster)
+    assert not emergency_preferred(A(0.5, 0.0), enc, own, faster)   # braking into it
+    # a stopped own ship has no heading: every action is acceptable
+    assert emergency_preferred(A(0.0, 0.1), enc, S(6, 0, 0, 0), faster)
 
 
 def test_stand_on_must_hold_course():

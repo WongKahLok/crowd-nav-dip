@@ -12,10 +12,13 @@ Order of preference, highest first:
 1. safe and rule-compliant (give-way duties; see ``breaks_rules``),
 2. safe (a rule is dropped when obeying it would leave nothing safe to do, which is
    how Rule 2 and Rule 17(b) are approximated: the rules never require a collision),
-3. the evasive action SARL falls back on when nothing is safe.
+3. the evasive action SARL falls back on when nothing is safe, steered by the rules:
+   among the options within ``emergency_tolerance`` of the most room, the one the
+   rules favour for the most urgent encounter wins (``colregs.emergency_preferred``).
 
-``rule_yielded`` counts the steps that fell to level 2 and ``rule_filtered`` the
-candidates removed at level 1, so the cost of the rules can be reported.
+``rule_yielded`` counts the steps that fell to level 2, ``rule_filtered`` the
+candidates removed at level 1 and ``rule_steered`` the emergency steps where the rules
+changed the evasive action, so the cost of the rules can be reported.
 
 Thresholds come from an optional ``[colregs]`` section of policy.config; the defaults
 match crowd_nav.policy.colregs, and a config without that section works unchanged.
@@ -24,6 +27,7 @@ import logging
 
 from crowd_nav.policy import colregs
 from crowd_nav.policy.sarl import SARL
+from crowd_sim.envs.utils.info import Collision
 
 
 class SARLColregs(SARL):
@@ -37,12 +41,15 @@ class SARLColregs(SARL):
         self.clear_range = colregs.CLEAR_RANGE
         self.min_turn = 5.0
         self.enforce_stand_on = False
+        # metres of evasive room an emergency action may give up to follow the rules
+        self.emergency_tolerance = 0.1
         # per-episode state and diagnostics
         self.tracker = None
         self.targets = []
         self.encounters = {}
         self.rule_yielded = 0
         self.rule_filtered = 0
+        self.rule_steered = 0
         self._apply_rules = True
         self._last_time = -1.0
 
@@ -55,12 +62,17 @@ class SARLColregs(SARL):
         self.min_turn = config.getfloat('colregs', 'min_turn', fallback=self.min_turn)
         self.enforce_stand_on = config.getboolean('colregs', 'enforce_stand_on',
                                                   fallback=self.enforce_stand_on)
+        self.emergency_tolerance = config.getfloat('colregs', 'emergency_tolerance',
+                                                   fallback=self.emergency_tolerance)
+        if self.emergency_tolerance < 0:
+            raise ValueError('emergency_tolerance must not be negative')
         self.name = 'SARL-COLREGs'
         logging.info('COLREGs filter: safe CPA %.2f m, range %.1f m, horizon %.0f s, '
                      'clear at %.1f m, alteration %.0f deg',
                      self.safe_cpa, self.max_range, self.max_tcpa, self.clear_range, self.min_turn)
-        logging.info('COLREGs enforced for: %s',
-                     'all roles' if self.enforce_stand_on else 'give-way duties only')
+        logging.info('COLREGs enforced for: %s; emergencies follow the rules within %.2f m',
+                     'all roles' if self.enforce_stand_on else 'give-way duties only',
+                     self.emergency_tolerance)
 
     # -- encounters -----------------------------------------------------------
 
@@ -110,7 +122,43 @@ class SARLColregs(SARL):
             return None
         return min(duties, key=lambda item: (max(item[1].tcpa, 0.0), item[1].distance))
 
+    def urgent_encounter(self):
+        """(target, encounter) closest in time to its CPA, whatever the role, or None."""
+        if not self.encounters:
+            return None
+        key, encounter = min(self.encounters.items(),
+                             key=lambda item: (max(item[1].tcpa, 0.0), item[1].distance))
+        return self.targets[key], encounter
+
     # -- selection ------------------------------------------------------------
+
+    def emergency_action(self, nav, candidates, others=()):
+        """SARL's evasive action, turned the way the rules point when that costs little.
+
+        The ranking is SARL's: no contact within the step first, then the most room
+        with the velocity held. Among the options within ``emergency_tolerance`` of
+        that room, the one ``colregs.emergency_preferred`` accepts for the most urgent
+        encounter wins. Stand-on encounters count as well: in extremis Rule 17(b) lets
+        the stand-on vessel act, and 17(c) still says which way not to.
+        """
+        urgent = self.urgent_encounter()
+        if urgent is None:
+            return super().emergency_action(nav, candidates, others)
+        target, encounter = urgent
+        held = {c.index: self.held_clearance(nav, c, others) for c in candidates}
+        clear_now = [c for c in candidates if not isinstance(c.info, Collision)] or candidates
+
+        def rank(c):
+            return held[c.index], -c.velocity_change
+
+        best = max(clear_now, key=rank)
+        near = [c for c in clear_now if held[c.index] >= held[best.index] - self.emergency_tolerance]
+        ruled = [c for c in near if colregs.emergency_preferred(c.action, encounter, nav, target,
+                                                                 min_turn=self.min_turn)]
+        choice = max(ruled, key=rank) if ruled else best
+        if choice is not best and not self._apply_rules:
+            self.rule_steered += 1  # counted on the pass whose action is executed
+        return choice.action
 
     def check_action(self, index, nav, action, humans, next_humans):
         """SARL's swept safety check, plus the rules while ``_apply_rules`` is on."""
