@@ -1,0 +1,36 @@
+{
+  "experiment": "sarl",
+  "policy": "sarl",
+  "model": "output-trained",
+  "settings": [
+    "--env_set",
+    "robot.visible=true"
+  ],
+  "ships": {
+    "sf": [
+      8
+    ],
+    "ht": [
+      8
+    ]
+  },
+  "trips": 100,
+  "seeds": "0-99",
+  "max_steps": 500,
+  "rule_check": {
+    "safe_cpa": 1.0,
+    "max_range": 10.0,
+    "max_tcpa": 20.0,
+    "clear_range": 3.0,
+    "min_turn": 5.0,
+    "trips": "every trip"
+  },
+  "started": "2026-10-06 21:50:17",
+  "minutes": 19.1,
+  "jobs": 13,
+  "commit": "76fe40a",
+  "local_changes": true,
+  "weights_sha256": "f8240c0c73fe0859",
+  "python": "3.10.20",
+  "torch": "2.8.0+cu126"
+}
