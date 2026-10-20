@@ -1,3 +1,5 @@
+import copy
+
 import numpy as np
 import rvo2
 from crowd_sim.envs.policy.policy import Policy
@@ -95,6 +97,12 @@ class ORCA(Policy):
         if self.sim is not None:
             del self.sim
             self.sim = None
+
+    def preview(self, state):
+        """Use a temporary simulator without touching cached state or last_state."""
+        policy = copy.copy(self)
+        policy.sim = None
+        return policy.predict(state)
 
     def predict(self, state):
         """

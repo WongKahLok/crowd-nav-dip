@@ -1,0 +1,33 @@
+# Every experiment of the project and the settings it runs under.
+# crowd_nav/exp.sh reads this table, so running, filming and rule-checking an
+# experiment always use exactly the same settings.
+#
+# Settings shared by every experiment (set in exp.sh):
+#   100 trips per map per ship count, always trips (seeds) 0-99, so every experiment
+#   faces the same situations; 10 trips run at once on 10 CPU cores; a trip gives up
+#   after 500 steps (125 s). Rule checks replay 25 trips per map and count another
+#   ship as a risk within 10 m and 20 s.
+#
+# Every experiment runs the 8-ship trips, so any two can be compared. The four
+# baselines also run lighter and heavier traffic, because the report needs three
+# traffic levels (SF only fits about 12 ships; HT fits about 25).
+#
+# Model folders are created from output-trained automatically when missing:
+#   output-visible   other ships can see our ship and move out of its way
+#   output-slowturn  our ship turns at 20 deg/s instead of 60
+#
+# name              policy        model folder     SF ships  HT ships  extra settings
+b1_orca_noglobal    orca          output-trained   4,8,12    4,8,16    --no_global_plan
+b2_theta_linear     linear        output-trained   4,8,12    4,8,16
+b3_theta_orca       orca          output-trained   4,8,12    4,8,16
+b4_theta_sarl       sarl          output-trained   4,8,12    4,8,16
+lookahead_fixed1    sarl          output-trained   8         8         --local_goal_dist 1 --monitor_dist 1
+lookahead_fixed5    sarl          output-trained   8         8         --local_goal_dist 5 --monitor_dist 5
+perception_r0       sarl          output-trained   8         8         --nearby_dist 0
+perception_r3       sarl          output-trained   8         8         --nearby_dist 3
+perception_r8       sarl          output-trained   8         8         --nearby_dist 8
+agility_20degs      sarl          output-slowturn  8         8
+visible_sarl        sarl          output-visible   8         8
+visible_colregs     sarl_colregs  output-visible   8         8
+visible_sarl_dense  sarl          output-visible   12        16,24
+visible_colregs_dense sarl_colregs output-visible  12        16,24

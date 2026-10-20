@@ -23,12 +23,13 @@ class FullState(object):
 
 
 class ObservableState(object):
-    def __init__(self, px, py, vx, vy, radius):
+    def __init__(self, px, py, vx, vy, radius, is_static=False):
         self.px = px
         self.py = py
         self.vx = vx
         self.vy = vy
         self.radius = radius
+        self.is_static = is_static
 
         self.position = (self.px, self.py)
         self.velocity = (self.vx, self.vy)
