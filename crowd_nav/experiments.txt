@@ -12,8 +12,20 @@
 #           --policy_set section.key=value   the same for policy.config
 # Here the other ships can see ours (robot.visible=true).
 #
-# name           policy        model folder    SF ships  HT ships  SG ships  settings
-sarl             sarl          output-trained  8         8         8         --env_set robot.visible=true
-colregs          sarl_colregs  output-trained  8         8         8         --env_set robot.visible=true
-sarl_dense       sarl          output-trained  12        16,24     12        --env_set robot.visible=true
-colregs_dense    sarl_colregs  output-trained  12        16,24     12        --env_set robot.visible=true
+# name           policy        model folder    SF ships  HT ships  settings
+sarl             sarl          output-trained  8         8         --env_set robot.visible=true
+colregs          sarl_colregs  output-trained  8         8         --env_set robot.visible=true
+sarl_dense       sarl          output-trained  12        16,24     --env_set robot.visible=true
+colregs_dense    sarl_colregs  output-trained  12        16,24     --env_set robot.visible=true
+visible_sarl     sarl          output-trained  8         8         --env_set robot.visible=true --policy_set action_space.query_env=true
+perception_r0m    sarl         output-trained  8         8         --env_set robot.visible=true --nearby_dist 0
+perception_r3m    sarl         output-trained  8         8         --env_set robot.visible=true --nearby_dist 3
+perception_r8m    sarl         output-trained  8         8         --env_set robot.visible=true --nearby_dist 8
+lookahead_fixed1m sarl         output-trained  8         8         --env_set robot.visible=true --local_goal_dist 1 --monitor_dist 1
+lookahead_fixed5m sarl         output-trained  8         8         --env_set robot.visible=true --local_goal_dist 5 --monitor_dist 5
+sarl_base    sarl  output-sarl            8  8  --env_set robot.visible=true
+sarl_reward_dsgn  sarl  output-reward_design   8  8  --env_set robot.visible=true
+sarl_domain_rdm      sarl  output-domain_rdm      8  8  --env_set robot.visible=true env.randomize_attributes=false
+sarl_base_rdmships sarl output-sarl 8 8 --env_set robot.visible=true env.randomize_attributes=true
+sarl_domain_rdm_rdmships  sarl  output-domain_rdm  8  8  --env_set robot.visible=true env.randomize_attributes=true
+sarl_domain_rdm_bigships  sarl  output-domain_rdm  8  8  --env_set robot.visible=true humans.radius=0.45 humans.v_pref=1.4
