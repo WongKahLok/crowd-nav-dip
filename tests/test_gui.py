@@ -227,3 +227,46 @@ def test_export_results_writes_the_file_and_reports_it(app, tmp_path):
     assert 'Results written to' in app.status.text()
     app.export_results(str(tmp_path / 'run.txt'))
     assert '.csv or .json' in app.status.text()
+
+
+def test_model_picker_lists_the_model_folders(app):
+    names = [app.model_combo.itemText(i) for i in range(app.model_combo.count())]
+    assert 'output-trained' in names
+    assert app.model_combo.currentText() == 'output-trained'
+    assert 'output-trained' in app.model_label.text()
+    assert app.model_load_button.isEnabled()
+
+
+def test_loading_another_model_keeps_the_map_and_clears_the_scenario(qapp, tmp_path):
+    from conftest import fake_model
+    other = fake_model(tmp_path / 'other-model')
+    built = []
+
+    def factory(model_dir):
+        built.append(model_dir)
+        return ScenarioSession(model_dir, policy=FixedPolicy())
+
+    session = ScenarioSession(str(MODEL_DIR), policy=FixedPolicy())
+    app = NavigatorApp(session, map_paths=[], model_root=str(tmp_path), session_factory=factory)
+    try:
+        assert app._load_map_file(str(write_map(tmp_path / 'map.png')))
+        click(app, 5.5, 5.5)
+        click(app, 44.5, 44.5)
+        assert app.session.state == 'planned'
+
+        assert app.load_model(str(MODEL_DIR)) and built == [], 'the loaded model is not rebuilt'
+        app.model_combo.setCurrentIndex(app._model_index(str(other)))
+        app.load_selected_model()
+        assert built == [str(other)]
+        assert app.session is not session and app.session.model_dir == str(other)
+        assert app.session.state == 'map', 'same map, no start, goal or route'
+        assert app.session.map_path == str(tmp_path / 'map.png')
+        assert 'other-model' in app.model_label.text()
+        assert 'set the start and goal again' in app.status.text()
+
+        broken = fake_model(tmp_path / 'broken', weights=False)
+        assert not app.load_model(str(broken))
+        assert 'weights' in app.status.text()
+        assert app.session.model_dir == str(other), 'a bad folder leaves the model alone'
+    finally:
+        app.close()

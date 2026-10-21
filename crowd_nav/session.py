@@ -35,6 +35,33 @@ class ScenarioError(Exception):
     """A problem the user can fix and retry; the GUI shows the message verbatim."""
 
 
+# what a trained model folder holds; evaluate.build_policy prefers the resumed weights
+MODEL_CONFIGS = ('env.config', 'policy.config')
+MODEL_WEIGHTS = ('resumed_rl_model.pth', 'rl_model.pth')
+
+
+def model_dir_problem(path):
+    """Why ``path`` is not a usable model folder, or None when it is."""
+    path = str(path)
+    if not os.path.isdir(path):
+        return 'Model folder not found: {}'.format(path)
+    for name in MODEL_CONFIGS:
+        if not os.path.exists(os.path.join(path, name)):
+            return 'Model config not found: {}'.format(os.path.join(path, name))
+    if not any(os.path.exists(os.path.join(path, name)) for name in MODEL_WEIGHTS):
+        return 'No trained weights ({}) in {}'.format(' or '.join(MODEL_WEIGHTS), path)
+    return None
+
+
+def find_model_dirs(root):
+    """The usable model folders directly under ``root``, sorted by name."""
+    root = str(root)
+    if not os.path.isdir(root):
+        return []
+    return sorted(os.path.join(root, name) for name in os.listdir(root)
+                  if model_dir_problem(os.path.join(root, name)) is None)
+
+
 @dataclass
 class EpisodeResult:
     """One finished episode: its metrics row, its frames, and the env that produced them.
@@ -83,6 +110,9 @@ class ScenarioSession(object):
         self.env_config.read(env_config_path)
 
         if policy is None:
+            problem = model_dir_problem(model_dir)
+            if problem:
+                raise ScenarioError(problem)
             import torch
             from crowd_nav import evaluate
             self.device = torch.device('cpu') if device is None else torch.device(device)

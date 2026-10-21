@@ -109,3 +109,14 @@ def seed():
     np.random.seed(0)
     torch.manual_seed(0)
     torch.set_num_threads(1)
+
+
+def fake_model(folder, weights=True, configs=('env.config', 'policy.config')):
+    """A model folder with the trained configs and, optionally, a placeholder weights file."""
+    trained = ROOT / 'crowd_nav' / 'data' / 'output-trained'
+    folder.mkdir()
+    for name in configs:
+        (folder / name).write_text((trained / name).read_text())
+    if weights:
+        (folder / 'rl_model.pth').write_bytes(b'')
+    return folder

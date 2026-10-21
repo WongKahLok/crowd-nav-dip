@@ -1,7 +1,7 @@
 """The Qt-free scenario session: map, ship, route, obstacles, episode, export."""
 import pytest
 
-from conftest import ROOT, FixedPolicy, write_map
+from conftest import ROOT, FixedPolicy, fake_model, write_map
 from crowd_nav import evaluate
 from crowd_nav.session import STATES, EpisodeResult, ScenarioError, ScenarioSession
 
@@ -299,3 +299,21 @@ def test_real_weights_run_a_short_episode(tmp_path):
     result = session.run_episode(max_steps=3)
     assert result.metrics['outcome'] in OUTCOMES
     assert result.metrics['steps'] == len(result.states) == 3
+
+
+def test_model_folders_are_checked_and_found(tmp_path):
+    from crowd_nav.session import find_model_dirs, model_dir_problem
+    good = fake_model(tmp_path / 'b_good')
+    fake_model(tmp_path / 'a_no_weights', weights=False)
+    fake_model(tmp_path / 'c_no_policy', configs=('env.config',))
+    (tmp_path / 'notes.txt').write_text('not a folder')
+    assert model_dir_problem(good) is None
+    assert model_dir_problem(MODEL_DIR) is None
+    assert 'weights' in model_dir_problem(tmp_path / 'a_no_weights')
+    assert 'policy.config' in model_dir_problem(tmp_path / 'c_no_policy')
+    assert 'not found' in model_dir_problem(tmp_path / 'missing')
+    assert find_model_dirs(tmp_path) == [str(good)]
+    assert find_model_dirs(tmp_path / 'missing') == []
+    # a session that has to load the weights says what is missing before trying
+    with pytest.raises(ScenarioError, match='weights'):
+        ScenarioSession(str(tmp_path / 'a_no_weights'))

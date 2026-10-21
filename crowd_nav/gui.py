@@ -29,11 +29,12 @@ from PyQt5.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, Q
                              QRadioButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
                              QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
-from crowd_nav.session import ScenarioError, ScenarioSession
+from crowd_nav.session import ScenarioError, ScenarioSession, find_model_dirs, model_dir_problem
 
 # this file is <repo>/crowd_nav/gui.py, so the repository root is two levels up
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_MODEL_DIR = os.path.join(REPO_ROOT, 'crowd_nav', 'data', 'output-trained')
+MODEL_ROOT = os.path.join(REPO_ROOT, 'crowd_nav', 'data')
+DEFAULT_MODEL_DIR = os.path.join(MODEL_ROOT, 'output-trained')
 STATIC_MAP_DIR = os.path.join(REPO_ROOT, 'static_maps')
 
 MAP_SIZE = 50.0
@@ -174,9 +175,13 @@ class MapView(object):
 class NavigatorApp(QMainWindow):
     """The window: control panel on the right, map/playback on the left, log at the bottom."""
 
-    def __init__(self, session, map_paths=(), parent=None):
+    def __init__(self, session, map_paths=(), parent=None, model_root=MODEL_ROOT,
+                 session_factory=None):
+        """``session_factory(model_dir)`` builds the session for another model folder;
+        by default a ScenarioSession with the current session's settings."""
         super().__init__(parent)
         self.session = session
+        self._session_factory = session_factory or self._session_like_current
         self.worker = None
         self._running = False
         self._closing = False
@@ -219,6 +224,11 @@ class NavigatorApp(QMainWindow):
         self.map_combo.addItems([os.path.basename(p) for p in map_paths])
         self._map_paths = list(map_paths)
         self._sync_widgets()
+        self._model_paths = []
+        for path in find_model_dirs(model_root) + [session.model_dir]:
+            self._add_model_path(path)
+        self.model_combo.setCurrentIndex(self._model_index(session.model_dir))
+        self._show_model()
         self._log('Model directory {}'.format(session.model_dir))
 
     # ----------------------------------------------------------- construction
@@ -241,8 +251,22 @@ class NavigatorApp(QMainWindow):
         return scroll
 
     def _build_map_group(self):
-        group = QGroupBox('1. Map')
+        group = QGroupBox('1. Model and map')
         layout = QVBoxLayout(group)
+        self.model_combo = QComboBox()
+        self.model_combo.setToolTip('Trained model folders: env.config, policy.config and weights')
+        self.model_browse_button = QPushButton('Browse…')
+        self.model_load_button = QPushButton('Load')
+        self.model_browse_button.clicked.connect(self._browse_model)
+        self.model_load_button.clicked.connect(self.load_selected_model)
+        row = QHBoxLayout()
+        row.addWidget(self.model_combo, 1)
+        row.addWidget(self.model_browse_button)
+        row.addWidget(self.model_load_button)
+        layout.addLayout(row)
+        self.model_label = QLabel('No model loaded')
+        self.model_label.setWordWrap(True)
+        layout.addWidget(self.model_label)
         self.map_combo = QComboBox()
         self.browse_button = QPushButton('Browse…')
         self.load_button = QPushButton('Load')
@@ -439,6 +463,9 @@ class NavigatorApp(QMainWindow):
         both_points = self.session.start_cell is not None and self.session.goal_cell is not None
 
         self.load_button.setEnabled(not running)
+        self.model_combo.setEnabled(not running)
+        self.model_browse_button.setEnabled(not running)
+        self.model_load_button.setEnabled(not running)
         self.browse_button.setEnabled(not running)
         self.map_combo.setEnabled(not running)
         self.start_radio.setEnabled(not running and state != 'no_map')
@@ -539,6 +566,90 @@ class NavigatorApp(QMainWindow):
         self.view.show_source = bool(checked)
         if self.session.plan_grid is not None:
             self.view.draw_map(self.session)
+
+    # ----------------------------------------------------------------- model
+
+    def _session_like_current(self, model_dir):
+        s = self.session
+        return ScenarioSession(model_dir, policy_name=s.policy_name,
+                               safety_distance=s.safety_distance, colregs=s.colregs,
+                               local_goal_dist=s.local_goal_dist, monitor_dist=s.monitor_dist,
+                               monitor_exit_dist=s.monitor_exit_dist,
+                               lookahead_rate=s.lookahead_rate, shore_clearance=s.shore_clearance,
+                               device=None if s.device is None else str(s.device))
+
+    @staticmethod
+    def _same_path(a, b):
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+    def _model_index(self, path):
+        return next((i for i, p in enumerate(self._model_paths) if self._same_path(p, path)), -1)
+
+    def _add_model_path(self, path):
+        if self._model_index(path) < 0:
+            self._model_paths.append(path)
+            self.model_combo.addItem(os.path.basename(os.path.normpath(path)))
+        return self._model_index(path)
+
+    def _show_model(self):
+        self.model_label.setText('Model {} ({})'.format(
+            os.path.basename(os.path.normpath(self.session.model_dir)),
+            getattr(self.session.policy, 'name', self.session.policy_name)))
+
+    def _browse_model(self):
+        path = QFileDialog.getExistingDirectory(self, 'Choose a trained model folder', MODEL_ROOT)
+        if not path:
+            return
+        problem = model_dir_problem(path)
+        if problem:
+            self._fail(problem)
+            return
+        self.model_combo.setCurrentIndex(self._add_model_path(path))
+        self.load_selected_model()
+
+    def load_selected_model(self, *_):
+        index = self.model_combo.currentIndex()
+        if not (0 <= index < len(self._model_paths)):
+            self._set_status('No model to load', error=True)
+            return
+        self.load_model(self._model_paths[index])
+
+    def load_model(self, path):
+        """Switch to the model in ``path``; the map stays, the scenario is cleared."""
+        if self._is_running():
+            return False
+        if self._same_path(path, self.session.model_dir):
+            self._set_status('Model {} is already loaded'.format(os.path.basename(path)))
+            return True
+        problem = model_dir_problem(path)
+        if problem:
+            self._fail(problem)
+            return False
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            session = self._session_factory(path)
+        except ScenarioError as error:
+            self._fail(error)
+            return False
+        except Exception as error:      # a folder whose weights do not fit the network
+            self._log(traceback.format_exc())
+            self._fail('Could not load the model in {}: {}'.format(path, error))
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._stop_playback()
+        self.view.scene = None
+        map_path = self.session.map_path
+        self.session = session
+        self._show_model()
+        self._log('Loaded model {}'.format(path))
+        if map_path is not None and self._load_map_file(map_path):
+            self._set_status('Model {} loaded - set the start and goal again'.format(
+                os.path.basename(path)))
+        else:
+            self._clear_results()
+            self._sync_widgets()
+        return True
 
     # ---------------------------------------------------------------- points
 
