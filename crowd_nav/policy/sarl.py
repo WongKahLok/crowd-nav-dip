@@ -106,6 +106,8 @@ class SARL(MultiHumanRL):
         self.safety_margin_dynamic = 0.2
         self.braking_check = True
         self.safety_horizon = 3.0
+        # land margin in force for the step being predicted, see coast_margin()
+        self.step_static_margin = None
         # diagnostics of the last prediction
         self.candidates = None
         self.safe_mask = None
@@ -214,6 +216,25 @@ class SARL(MultiHumanRL):
 
     # -- safety filter --------------------------------------------------------
 
+    COAST_SLACK = 0.01  # m a ship inside the land margin may close its gap by per step
+
+    def coast_margin(self, nav):
+        """Land margin for a step that starts at ``nav``.
+
+        Every candidate is swept from the current position, so a ship that is
+        already closer to land than ``safety_margin_static`` fails the check
+        whatever it does and stays in the emergency fallback, where the value
+        network is never consulted. Inside the margin the ship's own gap is
+        used instead: holding or opening it passes, closing it does not.
+        """
+        gap = static_clearance(nav.position, nav.position, nav.radius,
+                               getattr(self.env, 'land_rects', ()), getattr(self.env, 'map_bounds', None))
+        return max(0.0, min(self.safety_margin_static, gap - self.COAST_SLACK))
+
+    def land_margin(self):
+        """The land margin in force: the step's own while predicting, else the configured one."""
+        return self.safety_margin_static if self.step_static_margin is None else self.step_static_margin
+
     def braking_clearance(self, nav, humans):
         """Worst margin-adjusted gap while stopping from ``nav`` at ``max_decel``.
 
@@ -238,17 +259,21 @@ class SARL(MultiHumanRL):
                   for h in humans]
         clearance = math.inf
         elapsed = 0.0
+        braking_start = position
         while speed > 0:
             next_speed = max(0.0, speed - self.max_decel * dt)
             end = position + heading * (speed + next_speed) / 2 * dt
-            clearance = min(clearance, static_clearance(position, end, nav.radius, rects, bounds)
-                            - self.safety_margin_static)
             for k, (start, move, radius) in enumerate(others):
                 clearance = min(clearance, circle_clearance(position, end, nav.radius, start,
                                                             start + move, radius)
                                 - self.safety_margin_dynamic)
                 others[k] = (start + move, move, radius)
             position, speed, elapsed = end, next_speed, elapsed + dt
+        if elapsed > 0:
+            # The heading is held, so the braking path is one straight segment and a
+            # single sweep finds the same land gap as sweeping every substep.
+            clearance = min(clearance, static_clearance(braking_start, position, nav.radius, rects,
+                                                        bounds) - self.land_margin())
         remaining = self.safety_horizon - elapsed
         if remaining > 0:
             for start, move, radius in others:
@@ -261,7 +286,7 @@ class SARL(MultiHumanRL):
         """Sweep one candidate over the next step (and the braking after it)."""
         next_nav = advance(nav, action, self.time_step)
         reward, done, info = self.env.assess_motion(nav, next_nav, humans, next_humans)
-        clearance = min(info.min_sep_static - self.safety_margin_static,
+        clearance = min(info.min_sep_static - self.land_margin(),
                         info.min_sep_dynamic - self.safety_margin_dynamic)
         if self.braking_check and not done:
             clearance = min(clearance, self.braking_clearance(next_nav, next_humans))
@@ -275,19 +300,41 @@ class SARL(MultiHumanRL):
         return Candidate(index, action, next_nav, reward, done, info, clearance, safe, speed, change,
                          turn)
 
-    def emergency_action(self, nav, candidates):
-        """Least dangerous constrained deceleration when no candidate is safe.
+    def held_clearance(self, nav, candidate, others):
+        """Worst margin-adjusted gap if the candidate's velocity is held, not braked.
 
-        Only non-accelerating candidates are considered, so the answer is a
-        braking manoeuvre; a ship that is already at rest may move off instead.
-        Stopping is not assumed safe: every option is ranked by the same swept
-        clearance, so an oncoming ship makes the ship dodge rather than wait.
+        The braking check assumes the ship stops after the step, which is the
+        wrong model when another ship does not give way: braking in its path
+        only lets it arrive. Here the candidate velocity is held for
+        ``safety_horizon`` seconds against the extrapolated ships. Land is
+        checked one second ahead only, since the ship can still turn from it.
         """
-        speed = math.hypot(nav.vx, nav.vy)
-        pool = candidates
-        if speed >= self.stop_speed:
-            pool = [c for c in candidates if c.speed <= speed + 1e-9] or candidates
-        return max(pool, key=lambda c: (c.clearance, -c.speed, -c.velocity_change)).action
+        horizon = self.safety_horizon
+        start = candidate.next_nav.position
+        vx, vy = candidate.next_nav.vx, candidate.next_nav.vy
+        held = (start[0] + vx * horizon, start[1] + vy * horizon)
+        clearance = static_clearance(start, (start[0] + vx, start[1] + vy), nav.radius,
+                                     getattr(self.env, 'land_rects', ()),
+                                     getattr(self.env, 'map_bounds', None)) - self.land_margin()
+        for other in others:
+            end = (other.px + other.vx * horizon, other.py + other.vy * horizon)
+            clearance = min(clearance, circle_clearance(start, held, nav.radius, other.position, end,
+                                                        other.radius) - self.safety_margin_dynamic)
+        return clearance
+
+    def emergency_action(self, nav, candidates, others=()):
+        """Best evasive action when no candidate is safe.
+
+        An action that collides within the next step is never chosen while
+        another one does not. Among the rest the action that stays clearest
+        with its velocity held (see ``held_clearance``) wins, accelerating
+        ones included, so the ship dodges an oncoming ship instead of braking
+        in its path; ties go to the smallest change of velocity.
+        """
+        def rank(c):
+            return (not isinstance(c.info, Collision), self.held_clearance(nav, c, others),
+                    -c.velocity_change)
+        return max(candidates, key=rank).action
 
     # -- prediction -----------------------------------------------------------
 
@@ -295,8 +342,8 @@ class SARL(MultiHumanRL):
         """
         Score only the candidates that pass the swept safety check with the value
         network, charge ``continuity_weight`` per radian of heading change so
-        close scores keep the current course, and fall back to a constrained
-        deceleration when nothing is safe. The chosen action is executed exactly
+        close scores keep the current course, and fall back to the best evasive
+        action when nothing is safe. The chosen action is executed exactly
         as scored; nothing is smoothed afterwards.
 
         Reaching the goal in ``state`` (usually a local goal on the route) does
@@ -309,7 +356,14 @@ class SARL(MultiHumanRL):
         if self.phase == 'train' and self.epsilon is None:
             raise AttributeError('Epsilon attribute has to be set in training phase')
         self.emergency = False
+        self.step_static_margin = self.coast_margin(state.self_state)
+        try:
+            return self.select_action(state)
+        finally:
+            self.step_static_margin = None
 
+    def select_action(self, state):
+        """The body of ``predict``, run with the step's land margin in force."""
         nav = state.self_state
         humans, next_humans = self.env.predict_humans(state, self.query_env)
         actions = self.candidate_actions(nav)
@@ -322,7 +376,7 @@ class SARL(MultiHumanRL):
         self.emergency = not safe
 
         if not safe:
-            action = self.emergency_action(nav, candidates)
+            action = self.emergency_action(nav, candidates, next_humans)
         elif self.phase == 'train' and np.random.random() < self.epsilon:
             action = safe[np.random.choice(len(safe))].action
         else:

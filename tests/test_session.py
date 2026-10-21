@@ -1,7 +1,7 @@
 """The Qt-free scenario session: map, ship, route, obstacles, episode, export."""
 import pytest
 
-from conftest import ROOT, FixedPolicy, write_map
+from conftest import ROOT, FixedPolicy, fake_model, write_map
 from crowd_nav import evaluate
 from crowd_nav.session import STATES, EpisodeResult, ScenarioError, ScenarioSession
 
@@ -183,6 +183,51 @@ def test_run_episode_records_every_step(session, tmp_path):
     assert session.state == 'ran'
 
 
+def test_export_results_csv_is_one_row_in_the_batch_columns(session, tmp_path):
+    import csv
+    plan(session, tmp_path)
+    session.generate_obstacles(2, 7)
+    result = session.run_episode(max_steps=4)
+    path = session.export_results(result, tmp_path / 'run.csv')
+    with open(path, newline='') as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 1
+    row = rows[0]
+    assert list(row) == evaluate.CSV_FIELDS + ScenarioSession.CSV_EXTRA_FIELDS
+    assert (row['map'], row['seed'], row['requested_n_dynamic']) == ('map', '7', '2')
+    assert row['outcome'] == result.metrics['outcome'] and row['steps'] == '4'
+    assert row['n_dynamic'] == str(len(session.scenario['dyn']))
+
+
+def test_export_results_json_has_the_route_ships_and_trajectory(session, tmp_path):
+    import json
+    plan(session, tmp_path)
+    session.generate_obstacles(2, 7)
+    result = session.run_episode(max_steps=4)
+    obstacles = session.obstacle_table()
+    session.set_goal((40.5, 10.5))          # the window moves on; the export does not
+    with open(session.export_results(result, tmp_path / 'run.json')) as fh:
+        record = json.load(fh)
+    assert record['metrics'] == json.loads(json.dumps(result.metrics))
+    assert record['settings']['seed'] == 7 and record['settings']['goal'] == [44.5, 44.5]
+    assert len(record['obstacles']) == len(obstacles)
+    assert record['route'][0] == [5.5, 5.5] and record['route'][-1] == [44.5, 44.5]
+    trajectory = record['trajectory']
+    assert len(trajectory) == len(result.states) == 4
+    assert [step['t'] for step in trajectory] == [0.0, 0.25, 0.5, 0.75]
+    assert trajectory[0]['own_ship'][:2] == [5.5, 5.5]
+    assert all(len(step['ships']) == len(obstacles) for step in trajectory)
+
+
+def test_export_results_rejects_other_file_types(session, tmp_path):
+    plan(session, tmp_path)
+    result = session.run_episode(max_steps=2)
+    with pytest.raises(ScenarioError, match='.csv or .json'):
+        session.export_results(result, tmp_path / 'run.txt')
+    with pytest.raises(ScenarioError, match='Cannot write'):
+        session.export_results(result, tmp_path / 'missing' / 'run.csv')
+
+
 def test_run_episode_propagates_cancellation(session, tmp_path):
     plan(session, tmp_path)
 
@@ -254,3 +299,91 @@ def test_real_weights_run_a_short_episode(tmp_path):
     result = session.run_episode(max_steps=3)
     assert result.metrics['outcome'] in OUTCOMES
     assert result.metrics['steps'] == len(result.states) == 3
+
+
+def test_model_folders_are_checked_and_found(tmp_path):
+    from crowd_nav.session import find_model_dirs, model_dir_problem
+    good = fake_model(tmp_path / 'b_good')
+    fake_model(tmp_path / 'a_no_weights', weights=False)
+    fake_model(tmp_path / 'c_no_policy', configs=('env.config',))
+    (tmp_path / 'notes.txt').write_text('not a folder')
+    assert model_dir_problem(good) is None
+    assert model_dir_problem(MODEL_DIR) is None
+    assert 'weights' in model_dir_problem(tmp_path / 'a_no_weights')
+    assert 'policy.config' in model_dir_problem(tmp_path / 'c_no_policy')
+    assert 'not found' in model_dir_problem(tmp_path / 'missing')
+    assert find_model_dirs(tmp_path) == [str(good)]
+    assert find_model_dirs(tmp_path / 'missing') == []
+    # a session that has to load the weights says what is missing before trying
+    with pytest.raises(ScenarioError, match='weights'):
+        ScenarioSession(str(tmp_path / 'a_no_weights'))
+
+
+def test_add_obstacle_places_a_ship_with_its_own_water_route(session, tmp_path):
+    plan(session, tmp_path, blocks=[(20, 20, 30, 30)])      # an island mid-map
+    with pytest.raises(ScenarioError, match='Plan a route first'):
+        ScenarioSession(str(MODEL_DIR), policy=FixedPolicy()).add_obstacle((40, 10), (10, 40))
+    session.generate_obstacles(2, 7)
+    ship = session.add_obstacle((40.0, 10.0), (10.0, 40.0))  # across the island's corner
+    assert session.scenario['dyn'][-1] is ship and len(session.scenario['dyn']) == 3
+    assert ship['path'][0] == pytest.approx((40.0, 10.0)) and len(ship['path']) >= 2
+    assert all(not session.sim_grid.is_on_land(p) for p in ship['path'])
+    assert session.obstacle_table()[-1] == (40.0, 10.0, 10.0, 40.0)
+    # placed by hand, so the scenario no longer has a seed
+    assert session.last_seed is None and session.last_requested == 3
+    result = session.run_episode(max_steps=2)
+    assert result.context['seed'] == '' and result.context['requested_ships'] == 3
+    assert len(result.states[0][1]) == 3
+
+
+def test_add_obstacle_refuses_land_and_the_own_ship(session, tmp_path):
+    plan(session, tmp_path, blocks=[(20, 20, 30, 30)])
+    # image block rows 20-29 are world y 20-29 flipped: the island spans y 20..30
+    with pytest.raises(ScenarioError, match='Ship start .* is land'):
+        session.add_obstacle((25.5, 25.5), (40.0, 10.0))
+    with pytest.raises(ScenarioError, match='Ship goal .* is land'):
+        session.add_obstacle((40.0, 10.0), (25.5, 25.5))
+    with pytest.raises(ScenarioError, match='within 1 m of your start'):
+        session.add_obstacle((5.8, 5.5), (40.0, 10.0))
+    with pytest.raises(ScenarioError, match='within 1 m of your goal'):
+        session.add_obstacle((40.0, 10.0), (44.5, 44.0))
+    with pytest.raises(ScenarioError, match='too close to its start'):
+        session.add_obstacle((40.0, 10.0), (40.3, 10.0))
+    assert session.scenario['dyn'] == []
+
+
+def test_remove_obstacle_takes_off_the_last_ship(session, tmp_path):
+    plan(session, tmp_path)
+    assert session.remove_obstacle() is None
+    first = session.add_obstacle((40.0, 10.0), (10.0, 40.0))
+    second = session.add_obstacle((30.0, 5.0), (30.0, 40.0))
+    session.run_episode(max_steps=1)
+    assert session.remove_obstacle() is second
+    assert session.scenario['dyn'] == [first] and session.result is None
+
+
+def test_set_policy_keeps_the_scenario_and_drops_the_run(session, tmp_path):
+    plan(session, tmp_path)
+    session.generate_obstacles(2, 7)
+    ships = session.obstacle_table()
+    session.run_episode(max_steps=2)
+    other = FixedPolicy()
+    assert session.set_policy('sarl_colregs', policy=other) is other
+    assert session.policy is other and session.robot.policy is other
+    assert session.policy_name == 'sarl_colregs'
+    assert session.state == 'obstacles' and session.obstacle_table() == ships
+    assert session.result is None
+    with pytest.raises(ScenarioError, match='Unknown policy'):
+        session.set_policy('no_such_policy')
+    assert session.policy is other
+
+
+@pytest.mark.slow
+def test_set_policy_loads_sarl_colregs_from_the_model_folder(tmp_path):
+    from crowd_nav.policy.sarl_colregs import SARLColregs
+    session = ScenarioSession(str(MODEL_DIR))
+    plan(session, tmp_path)
+    session.set_policy('sarl_colregs')
+    assert isinstance(session.policy, SARLColregs) and session.policy.env is session.env
+    result = session.run_episode(max_steps=3)
+    assert result.context['policy'] == 'SARL-COLREGs'

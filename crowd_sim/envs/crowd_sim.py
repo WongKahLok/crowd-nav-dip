@@ -789,11 +789,13 @@ class CrowdSim_test(TransitionMixin, gym.Env):
         return ob
 
     def render(self, mode='human', output_file=None):
+        import matplotlib
         import matplotlib.pyplot as plt
 
         x_offset = 0.11
         y_offset = 0.11
-        cmap = plt.cm.get_cmap('hsv', 10)
+        # cm.get_cmap was removed in matplotlib 3.9
+        cmap = matplotlib.colormaps['hsv'].resampled(10)
         robot_color = 'yellow'
 
         if mode == 'human':

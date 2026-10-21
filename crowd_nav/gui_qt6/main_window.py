@@ -1,9 +1,9 @@
 from PyQt6.QtCore import QSize
 from PyQt6.QtWidgets import QHBoxLayout, QListWidget, QMainWindow, QStackedWidget, QWidget
 
-from crowd_nav.gui.screens.results_screen import ResultsScreen
-from crowd_nav.gui.screens.setup_screen import SetupScreen
-from crowd_nav.gui.screens.visualize_screen import VisualizeScreen
+from crowd_nav.gui_qt6.screens.results_screen import ResultsScreen
+from crowd_nav.gui_qt6.screens.setup_screen import SetupScreen
+from crowd_nav.gui_qt6.screens.visualize_screen import VisualizeScreen
 
 # Screens shown in the sidebar, in order. Add a screen by appending its class
 # here and to the QStackedWidget in _build_ui below.

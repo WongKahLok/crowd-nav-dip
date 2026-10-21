@@ -61,6 +61,7 @@ def test_playback_and_export_are_off_until_there_is_an_episode(app):
     assert not app.frame_slider.isEnabled()
     assert not app.speed_combo.isEnabled()
     assert not app.export_button.isEnabled()
+    assert not app.export_results_button.isEnabled()
     assert not app.cancel_button.isEnabled()
 
 
@@ -203,9 +204,154 @@ def test_playback_buttons_activate_with_a_scene(app, qapp):
     app._sync_widgets()
     assert app.play_button.isEnabled()
     assert app.export_button.isEnabled()
+    assert app.export_results_button.isEnabled()
 
     app._set_frame(2)
     assert app.view.scene.frame == 2
     assert 'frame 3/3' in app.time_label.text()
     app._on_slider(1)
     assert app.view.scene.frame == 1
+
+
+def test_export_results_writes_the_file_and_reports_it(app, tmp_path):
+    app.export_results(str(tmp_path / 'early.csv'))
+    assert 'Nothing to export' in app.status.text()
+    assert not (tmp_path / 'early.csv').exists()
+
+    click(app, 5.5, 5.5)
+    click(app, 44.5, 44.5)
+    app.session.run_episode(max_steps=3)
+    path = tmp_path / 'run.json'
+    app.export_results(str(path))
+    assert path.exists()
+    assert 'Results written to' in app.status.text()
+    app.export_results(str(tmp_path / 'run.txt'))
+    assert '.csv or .json' in app.status.text()
+
+
+def test_model_picker_lists_the_model_folders(app):
+    names = [app.model_combo.itemText(i) for i in range(app.model_combo.count())]
+    assert 'output-trained' in names
+    assert app.model_combo.currentText() == 'output-trained'
+    assert 'output-trained' in app.model_label.text()
+    assert app.model_load_button.isEnabled()
+
+
+def test_loading_another_model_keeps_the_map_and_clears_the_scenario(qapp, tmp_path):
+    from conftest import fake_model
+    other = fake_model(tmp_path / 'other-model')
+    built = []
+
+    def factory(model_dir):
+        built.append(model_dir)
+        return ScenarioSession(model_dir, policy=FixedPolicy())
+
+    session = ScenarioSession(str(MODEL_DIR), policy=FixedPolicy())
+    app = NavigatorApp(session, map_paths=[], model_root=str(tmp_path), session_factory=factory)
+    try:
+        assert app._load_map_file(str(write_map(tmp_path / 'map.png')))
+        click(app, 5.5, 5.5)
+        click(app, 44.5, 44.5)
+        assert app.session.state == 'planned'
+
+        assert app.load_model(str(MODEL_DIR)) and built == [], 'the loaded model is not rebuilt'
+        app.model_combo.setCurrentIndex(app._model_index(str(other)))
+        app.load_selected_model()
+        assert built == [str(other)]
+        assert app.session is not session and app.session.model_dir == str(other)
+        assert app.session.state == 'map', 'same map, no start, goal or route'
+        assert app.session.map_path == str(tmp_path / 'map.png')
+        assert 'other-model' in app.model_label.text()
+        assert 'set the start and goal again' in app.status.text()
+
+        broken = fake_model(tmp_path / 'broken', weights=False)
+        assert not app.load_model(str(broken))
+        assert 'weights' in app.status.text()
+        assert app.session.model_dir == str(other), 'a bad folder leaves the model alone'
+    finally:
+        app.close()
+
+
+def test_two_clicks_place_an_obstacle_ship(qapp, tmp_path):
+    app = new_window(qapp, tmp_path, blocks=[(20, 20, 30, 30)])
+    try:
+        assert not app.ship_radio.isEnabled() and not app.remove_ship_button.isEnabled()
+        click(app, 5.5, 5.5)
+        click(app, 44.5, 44.5)
+        assert app.ship_radio.isEnabled()
+        app.ship_radio.setChecked(True)
+        assert app.mode == 'ship'
+
+        click(app, 25.5, 25.5)                         # the island
+        assert 'is land' in app.status.text() and app._ship_start is None
+        click(app, 40.0, 10.0)
+        assert app._ship_start == (40.0, 10.0)
+        assert 'now click its goal' in app.status.text()
+        assert app.obstacle_table.rowCount() == 0
+        click(app, 10.0, 40.0)
+        assert app._ship_start is None
+        assert app.obstacle_table.rowCount() == 1
+        assert app.placed_label.text() == 'Placed 1 by hand'
+        assert app.remove_ship_button.isEnabled() and app.mode == 'ship'
+
+        click(app, 30.0, 5.0)                          # a second ship, abandoned half way
+        app.start_radio.setChecked(True)
+        assert app._ship_start is None and app.obstacle_table.rowCount() == 1
+
+        app.remove_last_ship()
+        assert app.obstacle_table.rowCount() == 0 and not app.remove_ship_button.isEnabled()
+    finally:
+        app.close()
+
+
+def test_losing_the_route_leaves_ship_placing_mode(app):
+    click(app, 5.5, 5.5)
+    click(app, 44.5, 44.5)
+    app.ship_radio.setChecked(True)
+    click(app, 40.0, 10.0)
+    click(app, 10.0, 40.0)
+    assert app.obstacle_table.rowCount() == 1
+    app.session.invalidate()                           # what a new start or goal does
+    app._refresh_after_change()
+    assert app.start_radio.isChecked() and app.mode == 'start'
+    assert not app.ship_radio.isEnabled() and not app.remove_ship_button.isEnabled()
+
+
+def test_policy_choice_keeps_the_scenario(qapp, tmp_path):
+    from crowd_nav.gui import POLICIES
+    chosen = []
+
+    def builder(name):
+        chosen.append(name)
+        if name == 'broken':
+            raise ScenarioError('weights do not fit')
+        return FixedPolicy()
+
+    from crowd_nav.session import ScenarioError
+    session = ScenarioSession(str(MODEL_DIR), policy=FixedPolicy())
+    app = NavigatorApp(session, map_paths=[], policy_builder=builder)
+    try:
+        assert [app.policy_combo.itemData(i) for i in range(app.policy_combo.count())] == \
+            [name for name, _ in POLICIES]
+        assert app.policy_combo.currentData() == 'sarl'
+        assert app._load_map_file(str(write_map(tmp_path / 'map.png')))
+        click(app, 5.5, 5.5)
+        click(app, 44.5, 44.5)
+        app.session.generate_obstacles(2, 3)
+        app.session.run_episode(max_steps=2)
+
+        assert app.load_policy('sarl_colregs')
+        assert chosen == ['sarl_colregs'] and app.session is session
+        assert app.session.policy_name == 'sarl_colregs'
+        assert app.policy_combo.currentData() == 'sarl_colregs'
+        assert app.session.state == 'obstacles', 'same route and ships, no run'
+        assert app.obstacle_table.rowCount() == 2
+        assert not app.export_results_button.isEnabled()
+        assert 'run again to compare' in app.status.text()
+
+        assert app.load_policy('sarl_colregs') and chosen == ['sarl_colregs'], 'no reload'
+        assert not app.load_policy('broken')
+        assert 'weights do not fit' in app.status.text()
+        assert app.policy_combo.currentData() == 'sarl_colregs', 'the list shows what sails'
+    finally:
+        app.close()

@@ -1,6 +1,6 @@
 from PyQt6.QtWidgets import QLabel
 
-from crowd_nav.gui.screens.base_screen import BaseScreen
+from crowd_nav.gui_qt6.screens.base_screen import BaseScreen
 
 
 class VisualizeScreen(BaseScreen):

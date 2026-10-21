@@ -85,3 +85,22 @@ def test_old_info_constructors():
     for cls in (Collision, ReachGoal, Timeout, Nothing):
         assert cls().collision_kind is None
     assert Danger(0.1).min_dist == 0.1
+
+
+def test_culled_static_clearance_matches_checking_every_rectangle():
+    import numpy as np
+    from crowd_sim.envs.utils.collision import rects_gap
+    rng = np.random.RandomState(0)
+    # land cells scattered over a 50 m map, the shape the maps produce
+    cells = rng.randint(0, 50, size=(400, 2)).astype(float)
+    rects = np.hstack([cells, cells + 1.0])
+    for _ in range(2000):
+        start = rng.uniform(0, 50, 2)
+        end = start + rng.uniform(-3, 3, 2) * rng.randint(0, 2)
+        radius = rng.uniform(0.1, 0.5)
+        assert static_clearance(start, end, radius, rects) == pytest.approx(
+            rects_gap(start, end, radius, rects), abs=1e-12)
+    # a lone rectangle far beyond every search radius is still found
+    far = np.array([[45.0, 45.0, 46.0, 46.0]])
+    assert static_clearance((1, 1), (1, 1), 0.3, far) == pytest.approx(
+        math.hypot(44, 44) - 0.3)

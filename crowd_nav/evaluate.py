@@ -115,7 +115,8 @@ def run_settings(policy, model_dir, extra=()):
 
 # Sections a config may leave out because the code falls back to defaults, with the keys
 # that are read from them. An override may add these; anything else has to exist already.
-OPTIONAL_KEYS = {'colregs': tuple(THRESHOLDS) + ('enforce_stand_on',)}
+OPTIONAL_KEYS = {'colregs': tuple(THRESHOLDS) + ('enforce_stand_on', 'multi_duty',
+                                                  'emergency_tolerance')}
 
 
 def apply_overrides(config, overrides, source):

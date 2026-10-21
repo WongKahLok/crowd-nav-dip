@@ -5,6 +5,7 @@ import pytest
 
 from crowd_sim.envs.utils.action import ActionRot, ActionXY
 from crowd_sim.envs.utils.human import Human
+from crowd_sim.envs.utils.info import Collision
 from crowd_sim.envs.utils.state import JointState
 
 from conftest import FixedPolicy
@@ -158,25 +159,38 @@ def test_braking_check_sees_moving_ships(make_env, make_sarl, env_cfg):
     assert not candidate.safe
 
 
-def test_emergency_fallback_decelerates_and_dodges_oncoming_ship(make_env, make_sarl, env_cfg):
+def emergency_candidates(policy, env, nav, ships):
+    humans, next_humans = env.predict_humans(JointState(nav, [s.get_observable_state() for s in ships]))
+    candidates = [policy.check_action(i, nav, a, humans, next_humans)
+                  for i, a in enumerate(policy.action_space)]
+    return [c._replace(safe=False) for c in candidates], next_humans
+
+
+def test_emergency_fallback_dodges_instead_of_braking(make_env, make_sarl, env_cfg):
     env = make_env()
     policy = make_sarl(env)
     policy.action_space = [ActionXY(1, 0), ActionXY(0.5, 0), ActionXY(0, 0), ActionXY(0.5, 0.5)]
     nav = moving(env.robot.get_full_state(), 0.8, 0.0)
-    humans, next_humans = [], []
-    candidates = [policy.check_action(i, nav, a, humans, next_humans)
-                  for i, a in enumerate(policy.action_space)]
-    # force everything unsafe with identical clearance: the slowest, straightest option wins
-    forced = [c._replace(safe=False, clearance=-1.0) for c in candidates]
-    assert policy.emergency_action(nav, forced) == ActionXY(0, 0)
-    # a dodge with more room beats stopping into an oncoming ship
-    forced[3] = forced[3]._replace(clearance=-0.2)
-    assert policy.emergency_action(nav, forced) == ActionXY(0.5, 0.5)
-    # accelerating options are never used while moving, even with the best clearance
-    forced[0] = forced[0]._replace(clearance=0.5)
-    assert policy.emergency_action(nav, forced) == ActionXY(0.5, 0.5)
-    # at rest every option is allowed
-    assert policy.emergency_action(moving(env.robot.get_full_state(), 0, 0), forced) == ActionXY(1, 0)
+    # a ship 3 m ahead coming straight at the robot: holding course and braking in
+    # its path both end in contact, turning away does not
+    oncoming = Human(env_cfg, 'humans')
+    oncoming.set(8.0, 5.0, 0, 5, -1, 0, 0)
+    forced, next_humans = emergency_candidates(policy, env, nav, [oncoming])
+    assert policy.emergency_action(nav, forced, next_humans) == ActionXY(0.5, 0.5)
+    held = [policy.held_clearance(nav, c, next_humans) for c in forced]
+    assert held[3] > held[2] and held[3] > held[0]
+
+    # an action that collides within this step loses to every one that does not,
+    # however much room it would have afterwards
+    forced[3] = forced[3]._replace(info=Collision(collision_kind='static'))
+    assert policy.emergency_action(nav, forced, next_humans) != ActionXY(0.5, 0.5)
+
+    # speeding up is allowed when it is what gets the ship clear: a ship crossing
+    # from starboard aims at where the slow options will be
+    crossing = Human(env_cfg, 'humans')
+    crossing.set(5.6, 3.0, 5.6, 9, 0, 1, 0)
+    forced, next_humans = emergency_candidates(policy, env, nav, [crossing])
+    assert policy.emergency_action(nav, forced, next_humans) == ActionXY(1, 0)
 
     # end to end: a ship bearing down on the robot makes stopping unsafe
     oncoming = Human(env_cfg, 'humans')
@@ -191,12 +205,12 @@ def test_emergency_fallback_decelerates_and_dodges_oncoming_ship(make_env, make_
     action = env.robot.act(ob)
     assert policy.emergency
     assert action != ActionXY(0, 0), 'stopping is not assumed safe'
-    assert action.vx < 0, 'the ship backs away from the oncoming ship'
     nav = env.robot.get_full_state()
     humans, next_humans = env.predict_humans(JointState(nav, ob))
     stop = policy.check_action(0, nav, ActionXY(0, 0), humans, next_humans)
     chosen = policy.check_action(0, nav, action, humans, next_humans)
-    assert stop.clearance < chosen.clearance < 0
+    assert (policy.held_clearance(nav, stop, next_humans)
+            < policy.held_clearance(nav, chosen, next_humans))
 
 
 def test_continuity_cost_breaks_near_ties(make_env, make_sarl):
@@ -296,3 +310,144 @@ def test_training_phase_explores_safe_candidates(make_env, make_sarl):
     for _ in range(10):
         assert env.robot.act(ob) != ActionXY(1, 0)
     assert policy.last_state is not None
+
+
+def test_braking_land_check_matches_sweeping_every_substep(make_env, make_sarl):
+    from crowd_sim.envs.utils.collision import static_clearance
+    env = make_env(obstacles=[dict(cx=x + 0.5, cy=y + 0.5, w=1, h=1)
+                              for x, y in [(7, 4), (7, 5), (3, 7), (8, 8), (2, 2)]])
+    policy = make_sarl(env)
+    rng = np.random.RandomState(0)
+    for _ in range(300):
+        nav = env.robot.get_full_state()
+        nav.px, nav.py = rng.uniform(1, 9, 2)
+        nav.position = (nav.px, nav.py)
+        moving(nav, *rng.uniform(-1, 1, 2))
+        # reference: the old per-substep sweep
+        dt, speed = policy.time_step, math.hypot(nav.vx, nav.vy)
+        heading, position = np.array((nav.vx, nav.vy)) / speed, np.array(nav.position)
+        expected = math.inf
+        while speed > 0:
+            next_speed = max(0.0, speed - policy.max_decel * dt)
+            end = position + heading * (speed + next_speed) / 2 * dt
+            expected = min(expected, static_clearance(position, end, nav.radius, env.land_rects,
+                                                      env.map_bounds) - policy.safety_margin_static)
+            position, speed = end, next_speed
+        got = policy.braking_clearance(nav, [])
+        assert got == pytest.approx(expected, abs=1e-9)
+
+
+def test_ship_inside_the_land_margin_may_hold_or_open_its_gap(make_env, make_sarl):
+    # land from x = 6.0 and the robot 0.1 m from it, inside the 0.2 m margin:
+    # every sweep starts too close, so before the coast margin nothing passed
+    env = make_env(obstacles=[dict(cx=6.5, cy=5, w=1, h=1)])
+    policy = make_sarl(env)
+    env.robot.set(5.6, 5, 18, 5, 0, 0, 0)
+    away, towards, along, stop = ActionXY(-0.5, 0), ActionXY(0.5, 0), ActionXY(0, 0.5), ActionXY(0, 0)
+    policy.action_space = [away, towards, along, stop]
+    action = env.robot.act(env.observe_at(env.robot.get_position()))
+    assert not policy.emergency
+    assert policy.safe_mask == [True, False, True, True], 'closing the gap still fails'
+    assert action != towards
+    assert policy.step_static_margin is None, 'the step margin does not outlive predict'
+    # with room to spare the configured margin applies unchanged
+    env.robot.set(3.0, 5, 18, 5, 0, 0, 0)
+    assert policy.coast_margin(env.robot.get_full_state()) == policy.safety_margin_static
+
+
+def test_colregs_emergency_follows_the_rules_when_it_costs_little(make_env, make_sarl, env_cfg):
+    from crowd_nav.policy import colregs
+    from crowd_nav.policy.sarl import SARL
+    from crowd_nav.policy.sarl_colregs import SARLColregs
+    env = make_env()
+    policy = make_sarl(env, cls=SARLColregs)
+    turn = math.radians(15)
+    port = ActionXY(0.8 * math.cos(turn), 0.8 * math.sin(turn))
+    starboard = ActionXY(0.8 * math.cos(turn), -0.8 * math.sin(turn))
+    policy.action_space = [port, starboard]
+    nav = moving(env.robot.get_full_state(), 0.8, 0.0)
+    # head-on, slightly to starboard, so turning to port leaves a little more room
+    oncoming = Human(env_cfg, 'humans')
+    oncoming.set(8.0, 4.97, 0, 5, -1, 0, 0)
+    forced, next_humans = emergency_candidates(policy, env, nav, [oncoming])
+    held = [policy.held_clearance(nav, c, next_humans) for c in forced]
+    assert held[0] > held[1], 'port has more room'
+    assert SARL.emergency_action(policy, nav, forced, next_humans) == port, 'plain SARL takes it'
+
+    policy.encounters = policy.update_encounters(JointState(nav, [oncoming.get_observable_state()]))
+    assert policy.urgent_encounter()[1].kind == colregs.HEAD_ON
+    policy._apply_rules = False                     # the pass whose action is executed
+    assert held[0] - held[1] < policy.emergency_tolerance
+    assert policy.emergency_action(nav, forced, next_humans) == starboard, 'Rule 14 within tolerance'
+    assert policy.rule_steered == 1
+    # more room than the tolerance is never given up for the rules
+    policy.emergency_tolerance = (held[0] - held[1]) / 2
+    assert policy.emergency_action(nav, forced, next_humans) == port
+    # without an encounter it is SARL's choice
+    policy.encounters = {}
+    policy.emergency_tolerance = 1.0
+    assert policy.emergency_action(nav, forced, next_humans) == port
+
+
+def colregs_with_duties(make_env, make_sarl, monkeypatch, breaks, duties):
+    """SARL-COLREGs on open water with stubbed encounters and a stubbed rule check.
+
+    ``duties`` maps a target key to its (role, tcpa); ``breaks`` maps an action to the
+    keys whose rule it breaks. Nothing else constrains the three candidates.
+    """
+    from crowd_nav.policy import colregs, sarl_colregs
+    from crowd_nav.policy.sarl_colregs import SARLColregs
+    env = make_env()
+    policy = make_sarl(env, cls=SARLColregs)
+    policy.action_space = list(breaks)
+    encounters = {key: colregs.Encounter(colregs.CROSSING, role, 45.0, -45.0, 5.0, 0.0, tcpa)
+                  for key, (role, tcpa) in duties.items()}
+
+    def update_encounters(state):
+        policy.targets = {key: None for key in encounters}
+        return dict(encounters)
+
+    monkeypatch.setattr(policy, 'update_encounters', update_encounters)
+    monkeypatch.setattr(sarl_colregs.colregs, 'violates',
+                        lambda action, encounter, *a, **k: next(
+                            key for key, e in encounters.items() if e is encounter) in breaks[action])
+    return policy, env
+
+
+def act(policy, env):
+    return env.robot.act(env.observe_at(env.robot.get_position()))
+
+
+def test_colregs_enforces_every_give_way_duty_at_once(make_env, make_sarl, monkeypatch):
+    from crowd_nav.policy import colregs
+    a, b, both = ActionXY(0.3, 0), ActionXY(0, 0.3), ActionXY(0.2, -0.2)
+    # `a` keeps ship 0's rule only, `b` ship 1's only, `both` keeps them all
+    policy, env = colregs_with_duties(
+        make_env, make_sarl, monkeypatch, {a: {1}, b: {0}, both: set()},
+        {0: (colregs.GIVE_WAY, 4.0), 1: (colregs.GIVE_WAY, 9.0), 2: (colregs.STAND_ON, 1.0)})
+    policy.encounters = policy.update_encounters(None)
+    assert [key for key, _ in policy.enforced_duties()] == [0, 1], 'give-way only, most urgent first'
+    assert act(policy, env) == both
+    assert not policy.emergency and policy.rule_relaxed == 0 and policy.rule_yielded == 0
+
+    # the old behaviour, for comparison runs: only the most urgent duty is enforced
+    policy.multi_duty = False
+    assert [key for key, _ in policy.enforced_duties()] == [0]
+    assert act(policy, env) in (a, both)
+
+
+def test_colregs_relaxes_the_least_urgent_duty_first(make_env, make_sarl, monkeypatch):
+    from crowd_nav.policy import colregs
+    a, b, neither = ActionXY(0.3, 0), ActionXY(0, 0.3), ActionXY(0.2, -0.2)
+    # no action keeps both rules; ship 0 is the closer in time, so its rule is kept
+    policy, env = colregs_with_duties(
+        make_env, make_sarl, monkeypatch, {a: {1}, b: {0}, neither: {0, 1}},
+        {0: (colregs.GIVE_WAY, 4.0), 1: (colregs.GIVE_WAY, 9.0)})
+    assert act(policy, env) == a
+    assert not policy.emergency and policy.rule_relaxed == 1 and policy.rule_yielded == 0
+
+    # when even the most urgent rule leaves nothing, the rules give way to safety
+    policy.action_space = [b, neither]
+    assert act(policy, env) in (b, neither)
+    assert not policy.emergency and policy.rule_relaxed == 1 and policy.rule_yielded == 1
+    assert policy._duties == [] and policy._apply_rules, 'no rule state leaks out of predict'

@@ -2,7 +2,7 @@ import sys
 
 from PyQt6.QtWidgets import QApplication
 
-from crowd_nav.gui.main_window import MainWindow
+from crowd_nav.gui_qt6.main_window import MainWindow
 
 
 def main():

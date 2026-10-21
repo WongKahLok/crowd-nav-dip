@@ -2,6 +2,8 @@
 
     python -m crowd_nav.gui [--model_dir DIR] [--map PNG] [--gpu] [--colregs]
 
+``--colregs`` starts with SARL + COLREGs; the Policy choice in the window switches.
+
 The window is one matplotlib axes that doubles as a click target and a playback screen,
 a scrolling panel of controls on the right, and a log at the bottom. Everything that
 touches the simulation goes through :class:`crowd_nav.session.ScenarioSession`; this
@@ -16,22 +18,27 @@ import threading
 import time
 import traceback
 
+# torch must load before PyQt5 on Windows, otherwise c10.dll fails with WinError 1114
+import torch  # noqa: F401
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.colors import ListedColormap
 from matplotlib.figure import Figure
 from PIL import Image
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog,
+from PyQt5.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
                              QFormLayout, QGroupBox, QHBoxLayout, QLabel, QMainWindow,
                              QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QRadioButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
                              QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
-from crowd_nav.session import ScenarioError, ScenarioSession
+from crowd_nav.session import ScenarioError, ScenarioSession, find_model_dirs, model_dir_problem
 
 # this file is <repo>/crowd_nav/gui.py, so the repository root is two levels up
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_MODEL_DIR = os.path.join(REPO_ROOT, 'crowd_nav', 'data', 'output-trained')
+MODEL_ROOT = os.path.join(REPO_ROOT, 'crowd_nav', 'data')
+# the policies the window offers: policy_factory name, label
+POLICIES = [('sarl', 'SARL'), ('sarl_colregs', 'SARL + COLREGs')]
+DEFAULT_MODEL_DIR = os.path.join(MODEL_ROOT, 'output-trained')
 STATIC_MAP_DIR = os.path.join(REPO_ROOT, 'static_maps')
 
 MAP_SIZE = 50.0
@@ -172,13 +179,21 @@ class MapView(object):
 class NavigatorApp(QMainWindow):
     """The window: control panel on the right, map/playback on the left, log at the bottom."""
 
-    def __init__(self, session, map_paths=(), parent=None):
+    def __init__(self, session, map_paths=(), parent=None, model_root=MODEL_ROOT,
+                 session_factory=None, policy_builder=None):
+        """``session_factory(model_dir)`` builds the session for another model folder;
+        by default a ScenarioSession with the current session's settings.
+        ``policy_builder(name)`` returns a ready policy for the Policy choice; by default
+        the session loads it from its model folder."""
         super().__init__(parent)
         self.session = session
+        self._session_factory = session_factory or self._session_like_current
+        self._policy_builder = policy_builder
         self.worker = None
         self._running = False
         self._closing = False
         self.mode = 'start'
+        self._ship_start = None      # first click of a hand-placed obstacle ship
 
         self.setWindowTitle('CrowdNav Scenario Builder')
 
@@ -217,6 +232,11 @@ class NavigatorApp(QMainWindow):
         self.map_combo.addItems([os.path.basename(p) for p in map_paths])
         self._map_paths = list(map_paths)
         self._sync_widgets()
+        self._model_paths = []
+        for path in find_model_dirs(model_root) + [session.model_dir]:
+            self._add_model_path(path)
+        self.model_combo.setCurrentIndex(self._model_index(session.model_dir))
+        self._show_model()
         self._log('Model directory {}'.format(session.model_dir))
 
     # ----------------------------------------------------------- construction
@@ -239,8 +259,31 @@ class NavigatorApp(QMainWindow):
         return scroll
 
     def _build_map_group(self):
-        group = QGroupBox('1. Map')
+        group = QGroupBox('1. Model and map')
         layout = QVBoxLayout(group)
+        self.model_combo = QComboBox()
+        self.model_combo.setToolTip('Trained model folders: env.config, policy.config and weights')
+        self.model_browse_button = QPushButton('Browse…')
+        self.model_load_button = QPushButton('Load')
+        self.model_browse_button.clicked.connect(self._browse_model)
+        self.model_load_button.clicked.connect(self.load_selected_model)
+        row = QHBoxLayout()
+        row.addWidget(self.model_combo, 1)
+        row.addWidget(self.model_browse_button)
+        row.addWidget(self.model_load_button)
+        layout.addLayout(row)
+        self.policy_combo = QComboBox()
+        for name, label in POLICIES:
+            self.policy_combo.addItem(label, name)
+        self.policy_combo.setToolTip('SARL + COLREGs filters the actions by the steering '
+                                     'rules (Rules 13-17). Switching keeps the scenario.')
+        self.policy_combo.activated.connect(self._on_policy_chosen)
+        row = QFormLayout()
+        row.addRow('Policy', self.policy_combo)
+        layout.addLayout(row)
+        self.model_label = QLabel('No model loaded')
+        self.model_label.setWordWrap(True)
+        layout.addWidget(self.model_label)
         self.map_combo = QComboBox()
         self.browse_button = QPushButton('Browse…')
         self.load_button = QPushButton('Load')
@@ -289,17 +332,55 @@ class NavigatorApp(QMainWindow):
         layout = QVBoxLayout(group)
         form = QFormLayout()
         self.count_spin = QSpinBox()
-        self.count_spin.setRange(0, 20)
+        self.count_spin.setRange(0, 50)
         self.count_spin.setValue(4)
         self.seed_spin = QSpinBox()
         self.seed_spin.setRange(0, 2 ** 31 - 1)
         self.seed_spin.setValue(0)
         form.addRow('Count', self.count_spin)
         form.addRow('seed', self.seed_spin)
+        # placement limits: lower spacing / wider spawn band / more tries fit more ships
+        self.spacing_spin = QDoubleSpinBox()
+        self.spacing_spin.setRange(0.0, 20.0)
+        self.spacing_spin.setSingleStep(0.5)
+        self.spacing_spin.setValue(3.0)
+        self.spacing_spin.setSuffix(' m')
+        self.spacing_spin.setToolTip('Minimum distance between ship start/goal points')
+        self.cross_min_spin = QDoubleSpinBox()
+        self.cross_min_spin.setRange(0.5, MAP_SIZE)
+        self.cross_min_spin.setSingleStep(0.5)
+        self.cross_min_spin.setValue(6.0)
+        self.cross_min_spin.setSuffix(' m')
+        self.cross_max_spin = QDoubleSpinBox()
+        self.cross_max_spin.setRange(0.5, MAP_SIZE)
+        self.cross_max_spin.setSingleStep(0.5)
+        self.cross_max_spin.setValue(14.0)
+        self.cross_max_spin.setSuffix(' m')
+        for spin in (self.cross_min_spin, self.cross_max_spin):
+            spin.setToolTip('Distance from the route at which a ship spawns')
+        self.trials_spin = QSpinBox()
+        self.trials_spin.setRange(1, 100000)
+        self.trials_spin.setValue(400)
+        self.trials_spin.setToolTip('Random placement attempts per ship before it is skipped')
+        form.addRow('spacing', self.spacing_spin)
+        form.addRow('spawn min', self.cross_min_spin)
+        form.addRow('spawn max', self.cross_max_spin)
+        form.addRow('tries / ship', self.trials_spin)
         layout.addLayout(form)
         self.generate_button = QPushButton('Generate random')
         self.generate_button.clicked.connect(self.generate_obstacles)
         layout.addWidget(self.generate_button)
+        # a third click mode, exclusive with Set start / Set goal: two clicks per ship
+        self.ship_radio = QRadioButton('Place ship: click its start, then its goal')
+        self.ship_radio.setToolTip('Generating random ships replaces the ones placed by hand')
+        self.point_group.addButton(self.ship_radio)
+        self.ship_radio.toggled.connect(self._on_mode_change)
+        self.remove_ship_button = QPushButton('Remove last')
+        self.remove_ship_button.clicked.connect(self.remove_last_ship)
+        row = QHBoxLayout()
+        row.addWidget(self.ship_radio, 1)
+        row.addWidget(self.remove_ship_button)
+        layout.addLayout(row)
         self.placed_label = QLabel('Placed 0 / 0')
         layout.addWidget(self.placed_label)
         self.obstacle_table = QTableWidget(0, 4)
@@ -376,6 +457,12 @@ class NavigatorApp(QMainWindow):
         self.export_button = QPushButton('Export MP4…')
         self.export_button.clicked.connect(self.export_video)
         layout.addWidget(self.export_button)
+        self.export_results_button = QPushButton('Export results…')
+        self.export_results_button.setToolTip('CSV: one metrics row, as in the batch results. '
+                                              'JSON: settings, metrics, route, ships and the '
+                                              'trajectory of every ship.')
+        self.export_results_button.clicked.connect(self.export_results)
+        layout.addWidget(self.export_results_button)
         return group
 
     # --------------------------------------------------------------- helpers
@@ -404,25 +491,39 @@ class NavigatorApp(QMainWindow):
         both_points = self.session.start_cell is not None and self.session.goal_cell is not None
 
         self.load_button.setEnabled(not running)
+        self.model_combo.setEnabled(not running)
+        self.model_browse_button.setEnabled(not running)
+        self.model_load_button.setEnabled(not running)
+        self.policy_combo.setEnabled(not running)
         self.browse_button.setEnabled(not running)
         self.map_combo.setEnabled(not running)
         self.start_radio.setEnabled(not running and state != 'no_map')
         self.goal_radio.setEnabled(not running and state != 'no_map')
         self.plan_button.setEnabled(not running and both_points)
         self.generate_button.setEnabled(not running and has_route)
+        if not has_route and self.ship_radio.isChecked():
+            self.start_radio.setChecked(True)      # no route, no ships to place
+        self.ship_radio.setEnabled(not running and has_route)
+        self.remove_ship_button.setEnabled(
+            not running and has_route and bool(self.session.scenario['dyn']))
         self.count_spin.setEnabled(not running and has_route)
         self.seed_spin.setEnabled(not running and has_route)
+        for spin in (self.spacing_spin, self.cross_min_spin, self.cross_max_spin,
+                     self.trials_spin):
+            spin.setEnabled(not running and has_route)
         self.run_button.setEnabled(not running and has_route)
         self.cancel_button.setEnabled(running)
         self.steps_spin.setEnabled(not running)
         self.gpu_box.setEnabled(not running)
         self.export_button.setEnabled(not running and self.session.result is not None)
+        self.export_results_button.setEnabled(not running and self.session.result is not None)
         playing = self.view.scene is not None
         self.play_button.setEnabled(playing)
         self.frame_slider.setEnabled(playing)
         self.speed_combo.setEnabled(playing)
 
     def _refresh_after_change(self):
+        self._ship_start = None          # the redraw drops a half-placed ship's marker
         self.view.draw_map(self.session)
         self.start_label.setText('Start: {}'.format(
             'not set' if self.session.start_centre is None
@@ -445,8 +546,11 @@ class NavigatorApp(QMainWindow):
         for i, row in enumerate(rows):
             for j, value in enumerate(row):
                 self.obstacle_table.setItem(i, j, QTableWidgetItem('{:.2f}'.format(value)))
-        requested = self.count_spin.value() if self.session.route is not None else 0
-        self.placed_label.setText('Placed {} / {}'.format(len(rows), requested))
+        if rows and self.session.last_seed is None:
+            self.placed_label.setText('Placed {} by hand'.format(len(rows)))
+        else:
+            requested = self.count_spin.value() if self.session.route is not None else 0
+            self.placed_label.setText('Placed {} / {}'.format(len(rows), requested))
         for warning in self.session.warnings:
             self._set_status(warning, error=True)
 
@@ -501,10 +605,133 @@ class NavigatorApp(QMainWindow):
         if self.session.plan_grid is not None:
             self.view.draw_map(self.session)
 
+    # ----------------------------------------------------------------- model
+
+    def _session_like_current(self, model_dir):
+        s = self.session
+        return ScenarioSession(model_dir, policy_name=s.policy_name,
+                               safety_distance=s.safety_distance, colregs=s.colregs,
+                               local_goal_dist=s.local_goal_dist, monitor_dist=s.monitor_dist,
+                               monitor_exit_dist=s.monitor_exit_dist,
+                               lookahead_rate=s.lookahead_rate, shore_clearance=s.shore_clearance,
+                               device=None if s.device is None else str(s.device))
+
+    @staticmethod
+    def _same_path(a, b):
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+    def _model_index(self, path):
+        return next((i for i, p in enumerate(self._model_paths) if self._same_path(p, path)), -1)
+
+    def _add_model_path(self, path):
+        if self._model_index(path) < 0:
+            self._model_paths.append(path)
+            self.model_combo.addItem(os.path.basename(os.path.normpath(path)))
+        return self._model_index(path)
+
+    def _show_model(self):
+        self.model_label.setText('Model {} ({})'.format(
+            os.path.basename(os.path.normpath(self.session.model_dir)),
+            getattr(self.session.policy, 'name', self.session.policy_name)))
+        index = self.policy_combo.findData(self.session.policy_name)
+        if index < 0:     # a policy started from the command line that the list lacks
+            self.policy_combo.addItem(self.session.policy_name, self.session.policy_name)
+            index = self.policy_combo.count() - 1
+        self.policy_combo.setCurrentIndex(index)
+
+    def _on_policy_chosen(self, index):
+        self.load_policy(self.policy_combo.itemData(index))
+
+    def load_policy(self, name):
+        """Switch the policy; the map, start, goal, route and ships stay."""
+        if self._is_running():
+            return False
+        if name == self.session.policy_name:
+            return True
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            policy = None if self._policy_builder is None else self._policy_builder(name)
+            self.session.set_policy(name, policy=policy)
+        except ScenarioError as error:
+            self._fail(error)
+            self._show_model()       # the list goes back to the policy still in use
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._stop_playback()
+        self._show_model()
+        self._log('Policy {}'.format(getattr(self.session.policy, 'name', name)))
+        if self.session.plan_grid is not None:
+            self._refresh_after_change()          # the scenario stays, the old run goes
+        else:
+            self._sync_widgets()
+        self._set_status('Sailing with {} - run again to compare'.format(
+            self.policy_combo.currentText()))
+        return True
+
+    def _browse_model(self):
+        path = QFileDialog.getExistingDirectory(self, 'Choose a trained model folder', MODEL_ROOT)
+        if not path:
+            return
+        problem = model_dir_problem(path)
+        if problem:
+            self._fail(problem)
+            return
+        self.model_combo.setCurrentIndex(self._add_model_path(path))
+        self.load_selected_model()
+
+    def load_selected_model(self, *_):
+        index = self.model_combo.currentIndex()
+        if not (0 <= index < len(self._model_paths)):
+            self._set_status('No model to load', error=True)
+            return
+        self.load_model(self._model_paths[index])
+
+    def load_model(self, path):
+        """Switch to the model in ``path``; the map stays, the scenario is cleared."""
+        if self._is_running():
+            return False
+        if self._same_path(path, self.session.model_dir):
+            self._set_status('Model {} is already loaded'.format(os.path.basename(path)))
+            return True
+        problem = model_dir_problem(path)
+        if problem:
+            self._fail(problem)
+            return False
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            session = self._session_factory(path)
+        except ScenarioError as error:
+            self._fail(error)
+            return False
+        except Exception as error:      # a folder whose weights do not fit the network
+            self._log(traceback.format_exc())
+            self._fail('Could not load the model in {}: {}'.format(path, error))
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._stop_playback()
+        self.view.scene = None
+        map_path = self.session.map_path
+        self.session = session
+        self._show_model()
+        self._log('Loaded model {}'.format(path))
+        if map_path is not None and self._load_map_file(map_path):
+            self._set_status('Model {} loaded - set the start and goal again'.format(
+                os.path.basename(path)))
+        else:
+            self._clear_results()
+            self._sync_widgets()
+        return True
+
     # ---------------------------------------------------------------- points
 
     def _on_mode_change(self, *_):
-        self.mode = 'start' if self.start_radio.isChecked() else 'goal'
+        self.mode = ('start' if self.start_radio.isChecked() else
+                     'ship' if self.ship_radio.isChecked() else 'goal')
+        if self._ship_start is not None:
+            self._ship_start = None
+            self.view.draw_map(self.session)      # drop the half-placed ship's marker
 
     def _on_click(self, event):
         if getattr(event, 'inaxes', None) is not self.ax:
@@ -520,6 +747,9 @@ class NavigatorApp(QMainWindow):
         world = ScenarioSession.world_from_click(event.xdata, event.ydata)
         if world is None:
             self._set_status('That point is off the canvas', error=True)
+            return
+        if self.mode == 'ship':
+            self._place_ship_click(world)
             return
         try:
             if self.mode == 'start':
@@ -539,6 +769,39 @@ class NavigatorApp(QMainWindow):
                 and self.session.scenario is None):
             self.plan_route()
 
+    def _place_ship_click(self, world):
+        """First click: the ship's start, marked on the map. Second click: its goal."""
+        if self._ship_start is None:
+            if self.session.plan_grid.is_on_land(world):
+                self._fail('Ship start ({:.1f}, {:.1f}) is land or inside the safety belt - '
+                           'click open water'.format(*world))
+                return
+            self._ship_start = world
+            self.ax.plot(*world, marker='o', markersize=8, markerfacecolor='none',
+                         markeredgecolor='#333333', linestyle='None', zorder=6)
+            self.canvas.draw_idle()
+            self._set_status('Ship start ({:.1f}, {:.1f}) - now click its goal'.format(*world))
+            return
+        try:
+            self.session.add_obstacle(self._ship_start, world)
+        except ScenarioError as error:
+            self._fail(error)        # the start stays; click another goal
+            return
+        self._log('Ship placed by hand: ({:.2f}, {:.2f}) -> ({:.2f}, {:.2f})'.format(
+            self._ship_start[0], self._ship_start[1], world[0], world[1]))
+        self._ship_start = None
+        self._refresh_after_change()
+        self._set_status('Placed ship {} - click the next ship\'s start'.format(
+            len(self.session.scenario['dyn'])))
+
+    def remove_last_ship(self):
+        self._ship_start = None
+        if self.session.remove_obstacle() is None:
+            self._set_status('No obstacle ships to remove', error=True)
+            return
+        self._refresh_after_change()
+        self._set_status('Removed the last ship - {} left'.format(len(self.session.scenario['dyn'])))
+
     def plan_route(self):
         try:
             scenario = self.session.plan_route()
@@ -554,7 +817,10 @@ class NavigatorApp(QMainWindow):
         n = self.count_spin.value()
         seed = self.seed_spin.value()
         try:
-            obstacles = self.session.generate_obstacles(n, seed)
+            obstacles = self.session.generate_obstacles(
+                n, seed, min_dist=self.spacing_spin.value(),
+                cross_dist=(self.cross_min_spin.value(), self.cross_max_spin.value()),
+                max_trials=self.trials_spin.value())
         except ScenarioError as error:
             self._fail(error)
             return
@@ -734,6 +1000,28 @@ class NavigatorApp(QMainWindow):
             QApplication.restoreOverrideCursor()
             self._sync_widgets()
 
+    def export_results(self, path=None):
+        """Save the last episode's results as CSV or JSON; ``path`` skips the dialog."""
+        result = self.session.result
+        if result is None:
+            self._set_status('Nothing to export yet', error=True)
+            return
+        if path is None:
+            path, chosen = QFileDialog.getSaveFileName(
+                self, 'Export results', 'episode.csv',
+                'CSV - one metrics row (*.csv);;JSON - full record with trajectory (*.json)')
+            if not path:
+                return
+            if not os.path.splitext(path)[1]:
+                path += '.json' if 'json' in chosen.lower() else '.csv'
+        try:
+            written = self.session.export_results(result, path)
+        except ScenarioError as error:
+            self._fail(error)
+            return
+        self._set_status('Results written to {}'.format(written))
+        self._log('Results written to {}'.format(written))
+
     # --------------------------------------------------------------- closing
 
     def closeEvent(self, event):
@@ -753,8 +1041,7 @@ def main(argv=None):
                             os.path.relpath(DEFAULT_MODEL_DIR, REPO_ROOT)))
     parser.add_argument('--map', default=None, help='map PNG to load at startup')
     parser.add_argument('--gpu', default=False, action='store_true')
-    parser.add_argument('--colregs', default=False, action='store_true',
-                        help='sail by the COLREGs: SARL with the rule filter (sarl_colregs)')
+    parser.add_argument('--colregs', default=False, action='store_true')
     parser.add_argument('--safety_distance', type=int, default=1)
     args = parser.parse_args(argv)
 
@@ -763,6 +1050,7 @@ def main(argv=None):
     try:
         session = ScenarioSession(model_dir, safety_distance=args.safety_distance,
                                   colregs=args.colregs,
+                                  policy_name='sarl_colregs' if args.colregs else 'sarl',
                                   device='cuda:0' if args.gpu else 'cpu')
     except Exception as error:
         QMessageBox.critical(None, 'CrowdNav', 'Could not load the policy:\n{}\n\n{}'.format(
