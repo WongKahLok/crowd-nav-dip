@@ -61,6 +61,7 @@ def test_playback_and_export_are_off_until_there_is_an_episode(app):
     assert not app.frame_slider.isEnabled()
     assert not app.speed_combo.isEnabled()
     assert not app.export_button.isEnabled()
+    assert not app.export_results_button.isEnabled()
     assert not app.cancel_button.isEnabled()
 
 
@@ -203,9 +204,26 @@ def test_playback_buttons_activate_with_a_scene(app, qapp):
     app._sync_widgets()
     assert app.play_button.isEnabled()
     assert app.export_button.isEnabled()
+    assert app.export_results_button.isEnabled()
 
     app._set_frame(2)
     assert app.view.scene.frame == 2
     assert 'frame 3/3' in app.time_label.text()
     app._on_slider(1)
     assert app.view.scene.frame == 1
+
+
+def test_export_results_writes_the_file_and_reports_it(app, tmp_path):
+    app.export_results(str(tmp_path / 'early.csv'))
+    assert 'Nothing to export' in app.status.text()
+    assert not (tmp_path / 'early.csv').exists()
+
+    click(app, 5.5, 5.5)
+    click(app, 44.5, 44.5)
+    app.session.run_episode(max_steps=3)
+    path = tmp_path / 'run.json'
+    app.export_results(str(path))
+    assert path.exists()
+    assert 'Results written to' in app.status.text()
+    app.export_results(str(tmp_path / 'run.txt'))
+    assert '.csv or .json' in app.status.text()

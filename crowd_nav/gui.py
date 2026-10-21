@@ -405,6 +405,12 @@ class NavigatorApp(QMainWindow):
         self.export_button = QPushButton('Export MP4…')
         self.export_button.clicked.connect(self.export_video)
         layout.addWidget(self.export_button)
+        self.export_results_button = QPushButton('Export results…')
+        self.export_results_button.setToolTip('CSV: one metrics row, as in the batch results. '
+                                              'JSON: settings, metrics, route, ships and the '
+                                              'trajectory of every ship.')
+        self.export_results_button.clicked.connect(self.export_results)
+        layout.addWidget(self.export_results_button)
         return group
 
     # --------------------------------------------------------------- helpers
@@ -449,6 +455,7 @@ class NavigatorApp(QMainWindow):
         self.steps_spin.setEnabled(not running)
         self.gpu_box.setEnabled(not running)
         self.export_button.setEnabled(not running and self.session.result is not None)
+        self.export_results_button.setEnabled(not running and self.session.result is not None)
         playing = self.view.scene is not None
         self.play_button.setEnabled(playing)
         self.frame_slider.setEnabled(playing)
@@ -768,6 +775,28 @@ class NavigatorApp(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
             self._sync_widgets()
+
+    def export_results(self, path=None):
+        """Save the last episode's results as CSV or JSON; ``path`` skips the dialog."""
+        result = self.session.result
+        if result is None:
+            self._set_status('Nothing to export yet', error=True)
+            return
+        if path is None:
+            path, chosen = QFileDialog.getSaveFileName(
+                self, 'Export results', 'episode.csv',
+                'CSV - one metrics row (*.csv);;JSON - full record with trajectory (*.json)')
+            if not path:
+                return
+            if not os.path.splitext(path)[1]:
+                path += '.json' if 'json' in chosen.lower() else '.csv'
+        try:
+            written = self.session.export_results(result, path)
+        except ScenarioError as error:
+            self._fail(error)
+            return
+        self._set_status('Results written to {}'.format(written))
+        self._log('Results written to {}'.format(written))
 
     # --------------------------------------------------------------- closing
 

@@ -37,12 +37,18 @@ class ScenarioError(Exception):
 
 @dataclass
 class EpisodeResult:
-    """One finished episode: its metrics row, its frames, and the env that produced them."""
+    """One finished episode: its metrics row, its frames, and the env that produced them.
+
+    ``context`` is the scenario as it was when the episode ran (map, seed, route,
+    obstacles, settings), so an export describes this episode even if the window has
+    moved on since.
+    """
 
     metrics: dict
     states: list
     env: object
     warnings: list = field(default_factory=list)
+    context: dict = field(default_factory=dict)
 
     def render_env(self):
         """``env`` carrying *this* result's frames.
@@ -104,6 +110,7 @@ class ScenarioSession(object):
         self.result = None
         self.warnings = []
         self.last_seed = None
+        self.last_requested = None
 
     # ------------------------------------------------------------------ state
 
@@ -255,6 +262,7 @@ class ScenarioSession(object):
             self.result = None
             self.warnings = []
             self.last_seed = seed
+            self.last_requested = 0
             return []
         obstacles = self.plan_grid.generate_crossing_obstacles(
             n, self.route, forb_list=[self.start_centre, self.goal_centre],
@@ -268,6 +276,7 @@ class ScenarioSession(object):
         self.scenario['dyn'] = obstacles
         self.result = None
         self.last_seed = seed
+        self.last_requested = n
         return obstacles
 
     # ---------------------------------------------------------------- episode
@@ -285,11 +294,34 @@ class ScenarioSession(object):
                               monitor_exit_dist=self.monitor_exit_dist,
                               lookahead_rate=self.lookahead_rate,
                               shore_clearance=self.shore_clearance)
+        context = self._context(max_steps)   # before the run: it reads the scenario as set
         row = evaluate.run_episode(self.env, self.robot, self.sim_grid, self.scenario, cfg,
                                    on_step=on_step)
         self.result = EpisodeResult(metrics=row, states=self.env.states, env=self.env,
-                                    warnings=list(self.warnings))
+                                    warnings=list(self.warnings), context=context)
         return self.result
+
+    def _context(self, max_steps):
+        """The scenario and settings of the episode about to run, for its exports."""
+        dyn = self.scenario['dyn']
+        return {
+            'map': os.path.splitext(os.path.basename(self.map_path))[0],
+            'map_path': self.map_path,
+            'model_dir': self.model_dir,
+            'policy': getattr(self.policy, 'name', self.policy_name),
+            'colregs': self.colregs,
+            'seed': self.last_seed if dyn else '',
+            'requested_ships': self.last_requested if dyn else 0,
+            'max_steps': max_steps,
+            'time_step': self.time_step,
+            'start': list(self.start_centre),
+            'goal': list(self.goal_centre),
+            'route': [list(p) for p in self.route],
+            'obstacles': [dict(zip(('px', 'py', 'gx', 'gy'), row)) for row in self.obstacle_table()],
+            'local_goal_dist': self.local_goal_dist,
+            'monitor_dist': self.monitor_dist,
+            'shore_clearance': self.shore_clearance,
+        }
 
     # ----------------------------------------------------------------- export
 
@@ -308,6 +340,63 @@ class ScenarioSession(object):
         scene = EpisodeAnimation(result.render_env(), ax)
         anim = scene.animate(figure, result.env.time_step * 1000)
         return save_animation(anim, path, fps=fps, progress=progress)
+
+    # Columns a results CSV adds after crowd_nav.evaluate's, which describe the batch runs.
+    CSV_EXTRA_FIELDS = ['policy', 'colregs', 'model_dir', 'map_path']
+
+    def export_results(self, result, path):
+        """Write the episode's results to ``path`` and return the path written.
+
+        ``.csv`` is one row with the columns of ``crowd_nav.evaluate``'s result CSVs
+        (then policy, colregs, model and map path), so a GUI run lines up with a batch
+        run. ``.json`` is the full record: settings, metrics, route, obstacle ships and
+        every ship's position and velocity at every step.
+        """
+        import csv
+        import json
+        from crowd_nav import evaluate
+        path = str(path)
+        kind = os.path.splitext(path)[1].lower()
+        if kind not in ('.csv', '.json'):
+            raise ScenarioError('Choose a .csv or .json file, not {}'.format(
+                os.path.basename(path)))
+        context = result.context
+        try:
+            if kind == '.csv':
+                row = dict.fromkeys(evaluate.CSV_FIELDS, '')
+                row.update(result.metrics)
+                row.update(map=context.get('map', ''), seed=context.get('seed', ''),
+                           requested_n_dynamic=context.get('requested_ships', ''))
+                row.update({key: context.get(key, '') for key in self.CSV_EXTRA_FIELDS})
+                with open(path, 'w', newline='') as fh:
+                    writer = csv.DictWriter(fh, fieldnames=evaluate.CSV_FIELDS + self.CSV_EXTRA_FIELDS,
+                                            extrasaction='ignore')
+                    writer.writeheader()
+                    writer.writerow(row)
+            else:
+                record = {'settings': {k: v for k, v in context.items()
+                                       if k not in ('route', 'obstacles')},
+                          'metrics': result.metrics,
+                          'warnings': result.warnings,
+                          'route': context.get('route', []),
+                          'obstacles': context.get('obstacles', []),
+                          'trajectory': self._trajectory(result)}
+                with open(path, 'w') as fh:
+                    json.dump(record, fh, indent=1, default=float)
+        except OSError as exc:
+            raise ScenarioError('Cannot write {}: {}'.format(path, exc.strerror or exc))
+        return path
+
+    @staticmethod
+    def _trajectory(result):
+        """Per step: time, own ship (x, y, vx, vy) and each obstacle ship (x, y, vx, vy)."""
+        dt = result.context.get('time_step', result.env.time_step)
+
+        def motion(s):
+            return [round(float(v), 4) for v in (s.px, s.py, s.vx, s.vy)]
+
+        return [{'t': round(k * dt, 4), 'own_ship': motion(own), 'ships': [motion(s) for s in ships]}
+                for k, (own, ships) in enumerate(result.states)]
 
     # ------------------------------------------------------------------ misc
 

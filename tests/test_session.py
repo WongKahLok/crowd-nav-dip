@@ -183,6 +183,51 @@ def test_run_episode_records_every_step(session, tmp_path):
     assert session.state == 'ran'
 
 
+def test_export_results_csv_is_one_row_in_the_batch_columns(session, tmp_path):
+    import csv
+    plan(session, tmp_path)
+    session.generate_obstacles(2, 7)
+    result = session.run_episode(max_steps=4)
+    path = session.export_results(result, tmp_path / 'run.csv')
+    with open(path, newline='') as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 1
+    row = rows[0]
+    assert list(row) == evaluate.CSV_FIELDS + ScenarioSession.CSV_EXTRA_FIELDS
+    assert (row['map'], row['seed'], row['requested_n_dynamic']) == ('map', '7', '2')
+    assert row['outcome'] == result.metrics['outcome'] and row['steps'] == '4'
+    assert row['n_dynamic'] == str(len(session.scenario['dyn']))
+
+
+def test_export_results_json_has_the_route_ships_and_trajectory(session, tmp_path):
+    import json
+    plan(session, tmp_path)
+    session.generate_obstacles(2, 7)
+    result = session.run_episode(max_steps=4)
+    obstacles = session.obstacle_table()
+    session.set_goal((40.5, 10.5))          # the window moves on; the export does not
+    with open(session.export_results(result, tmp_path / 'run.json')) as fh:
+        record = json.load(fh)
+    assert record['metrics'] == json.loads(json.dumps(result.metrics))
+    assert record['settings']['seed'] == 7 and record['settings']['goal'] == [44.5, 44.5]
+    assert len(record['obstacles']) == len(obstacles)
+    assert record['route'][0] == [5.5, 5.5] and record['route'][-1] == [44.5, 44.5]
+    trajectory = record['trajectory']
+    assert len(trajectory) == len(result.states) == 4
+    assert [step['t'] for step in trajectory] == [0.0, 0.25, 0.5, 0.75]
+    assert trajectory[0]['own_ship'][:2] == [5.5, 5.5]
+    assert all(len(step['ships']) == len(obstacles) for step in trajectory)
+
+
+def test_export_results_rejects_other_file_types(session, tmp_path):
+    plan(session, tmp_path)
+    result = session.run_episode(max_steps=2)
+    with pytest.raises(ScenarioError, match='.csv or .json'):
+        session.export_results(result, tmp_path / 'run.txt')
+    with pytest.raises(ScenarioError, match='Cannot write'):
+        session.export_results(result, tmp_path / 'missing' / 'run.csv')
+
+
 def test_run_episode_propagates_cancellation(session, tmp_path):
     plan(session, tmp_path)
 
