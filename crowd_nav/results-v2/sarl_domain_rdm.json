@@ -29,10 +29,10 @@
     "min_turn": 5.0,
     "trips": "every trip"
   },
-  "started": "2026-10-21 00:18:21",
-  "minutes": 41.8,
+  "started": "2026-10-21 18:43:38",
+  "minutes": 24.8,
   "jobs": 15,
-  "commit": "2936063",
+  "commit": "51093d0",
   "local_changes": true,
   "weights_sha256": "4c4d5c98ce2be3e1",
   "python": "3.10.20",

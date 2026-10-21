@@ -12,6 +12,9 @@
     ],
     "ht": [
       8
+    ],
+    "sg": [
+      8
     ]
   },
   "trips": 100,
@@ -25,10 +28,10 @@
     "min_turn": 5.0,
     "trips": "every trip"
   },
-  "started": "2026-10-06 21:50:17",
-  "minutes": 19.1,
-  "jobs": 13,
-  "commit": "76fe40a",
+  "started": "2026-10-21 20:42:07",
+  "minutes": 11.0,
+  "jobs": 15,
+  "commit": "51093d0",
   "local_changes": true,
   "weights_sha256": "f8240c0c73fe0859",
   "python": "3.10.20",
