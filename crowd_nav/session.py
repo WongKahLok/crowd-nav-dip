@@ -309,6 +309,56 @@ class ScenarioSession(object):
         self.last_requested = n
         return obstacles
 
+    # an obstacle ship placed by hand keeps at least this far from the own ship's start and
+    # goal, so it does not begin or end the episode in contact (as the generator's min_dist)
+    MIN_OBSTACLE_GAP = 1.0
+
+    def add_obstacle(self, start, goal):
+        """Add one obstacle ship sailing from `start` to `goal` (world positions).
+
+        Both ends must be open water (outside the safety belt) and keep
+        ``MIN_OBSTACLE_GAP`` from the own ship's start and goal. Like a generated ship
+        it follows its own land-free Theta* route. A scenario with hand-placed ships has
+        no seed; generating random ships replaces them.
+        """
+        if self.scenario is None or self.route is None:
+            raise ScenarioError('Plan a route first')
+        for name, pos in (('start', start), ('goal', goal)):
+            if pos is None:
+                raise ScenarioError('That point is off the canvas')
+            if self.plan_grid.is_on_land(pos):
+                raise ScenarioError('Ship {} ({:.1f}, {:.1f}) is land or inside the safety belt'
+                                    ' - click open water'.format(name, pos[0], pos[1]))
+            for own, point in (('start', self.start_centre), ('goal', self.goal_centre)):
+                if math.dist(pos, point) < self.MIN_OBSTACLE_GAP:
+                    raise ScenarioError('Ship {} is within {:g} m of your {} - click further away'
+                                        .format(name, self.MIN_OBSTACLE_GAP, own))
+        if math.dist(start, goal) < self.MIN_OBSTACLE_GAP:
+            raise ScenarioError("The ship's goal is too close to its start")
+        path = self.plan_grid.plan_world_path(tuple(start), tuple(goal))
+        if path is None:
+            raise ScenarioError('No water route from ({:.1f}, {:.1f}) to ({:.1f}, {:.1f})'
+                                .format(start[0], start[1], goal[0], goal[1]))
+        obstacle = {'px': float(start[0]), 'py': float(start[1]),
+                    'gx': float(goal[0]), 'gy': float(goal[1]), 'path': path}
+        self.scenario['dyn'].append(obstacle)
+        self._obstacles_edited()
+        return obstacle
+
+    def remove_obstacle(self):
+        """Remove the most recently added obstacle ship; returns it, or None if none."""
+        if self.scenario is None or not self.scenario['dyn']:
+            return None
+        obstacle = self.scenario['dyn'].pop()
+        self._obstacles_edited()
+        return obstacle
+
+    def _obstacles_edited(self):
+        self.result = None
+        self.warnings = []
+        self.last_seed = None
+        self.last_requested = len(self.scenario['dyn'])
+
     # ---------------------------------------------------------------- episode
 
     def run_episode(self, max_steps=2000, on_step=None):
@@ -340,7 +390,7 @@ class ScenarioSession(object):
             'model_dir': self.model_dir,
             'policy': getattr(self.policy, 'name', self.policy_name),
             'colregs': self.colregs,
-            'seed': self.last_seed if dyn else '',
+            'seed': self.last_seed if dyn and self.last_seed is not None else '',
             'requested_ships': self.last_requested if dyn else 0,
             'max_steps': max_steps,
             'time_step': self.time_step,

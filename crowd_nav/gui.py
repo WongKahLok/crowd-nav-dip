@@ -186,6 +186,7 @@ class NavigatorApp(QMainWindow):
         self._running = False
         self._closing = False
         self.mode = 'start'
+        self._ship_start = None      # first click of a hand-placed obstacle ship
 
         self.setWindowTitle('CrowdNav Scenario Builder')
 
@@ -353,6 +354,17 @@ class NavigatorApp(QMainWindow):
         self.generate_button = QPushButton('Generate random')
         self.generate_button.clicked.connect(self.generate_obstacles)
         layout.addWidget(self.generate_button)
+        # a third click mode, exclusive with Set start / Set goal: two clicks per ship
+        self.ship_radio = QRadioButton('Place ship: click its start, then its goal')
+        self.ship_radio.setToolTip('Generating random ships replaces the ones placed by hand')
+        self.point_group.addButton(self.ship_radio)
+        self.ship_radio.toggled.connect(self._on_mode_change)
+        self.remove_ship_button = QPushButton('Remove last')
+        self.remove_ship_button.clicked.connect(self.remove_last_ship)
+        row = QHBoxLayout()
+        row.addWidget(self.ship_radio, 1)
+        row.addWidget(self.remove_ship_button)
+        layout.addLayout(row)
         self.placed_label = QLabel('Placed 0 / 0')
         layout.addWidget(self.placed_label)
         self.obstacle_table = QTableWidget(0, 4)
@@ -472,6 +484,11 @@ class NavigatorApp(QMainWindow):
         self.goal_radio.setEnabled(not running and state != 'no_map')
         self.plan_button.setEnabled(not running and both_points)
         self.generate_button.setEnabled(not running and has_route)
+        if not has_route and self.ship_radio.isChecked():
+            self.start_radio.setChecked(True)      # no route, no ships to place
+        self.ship_radio.setEnabled(not running and has_route)
+        self.remove_ship_button.setEnabled(
+            not running and has_route and bool(self.session.scenario['dyn']))
         self.count_spin.setEnabled(not running and has_route)
         self.seed_spin.setEnabled(not running and has_route)
         for spin in (self.spacing_spin, self.cross_min_spin, self.cross_max_spin,
@@ -489,6 +506,7 @@ class NavigatorApp(QMainWindow):
         self.speed_combo.setEnabled(playing)
 
     def _refresh_after_change(self):
+        self._ship_start = None          # the redraw drops a half-placed ship's marker
         self.view.draw_map(self.session)
         self.start_label.setText('Start: {}'.format(
             'not set' if self.session.start_centre is None
@@ -511,8 +529,11 @@ class NavigatorApp(QMainWindow):
         for i, row in enumerate(rows):
             for j, value in enumerate(row):
                 self.obstacle_table.setItem(i, j, QTableWidgetItem('{:.2f}'.format(value)))
-        requested = self.count_spin.value() if self.session.route is not None else 0
-        self.placed_label.setText('Placed {} / {}'.format(len(rows), requested))
+        if rows and self.session.last_seed is None:
+            self.placed_label.setText('Placed {} by hand'.format(len(rows)))
+        else:
+            requested = self.count_spin.value() if self.session.route is not None else 0
+            self.placed_label.setText('Placed {} / {}'.format(len(rows), requested))
         for warning in self.session.warnings:
             self._set_status(warning, error=True)
 
@@ -654,7 +675,11 @@ class NavigatorApp(QMainWindow):
     # ---------------------------------------------------------------- points
 
     def _on_mode_change(self, *_):
-        self.mode = 'start' if self.start_radio.isChecked() else 'goal'
+        self.mode = ('start' if self.start_radio.isChecked() else
+                     'ship' if self.ship_radio.isChecked() else 'goal')
+        if self._ship_start is not None:
+            self._ship_start = None
+            self.view.draw_map(self.session)      # drop the half-placed ship's marker
 
     def _on_click(self, event):
         if getattr(event, 'inaxes', None) is not self.ax:
@@ -670,6 +695,9 @@ class NavigatorApp(QMainWindow):
         world = ScenarioSession.world_from_click(event.xdata, event.ydata)
         if world is None:
             self._set_status('That point is off the canvas', error=True)
+            return
+        if self.mode == 'ship':
+            self._place_ship_click(world)
             return
         try:
             if self.mode == 'start':
@@ -688,6 +716,39 @@ class NavigatorApp(QMainWindow):
         if (self.session.start_cell is not None and self.session.goal_cell is not None
                 and self.session.scenario is None):
             self.plan_route()
+
+    def _place_ship_click(self, world):
+        """First click: the ship's start, marked on the map. Second click: its goal."""
+        if self._ship_start is None:
+            if self.session.plan_grid.is_on_land(world):
+                self._fail('Ship start ({:.1f}, {:.1f}) is land or inside the safety belt - '
+                           'click open water'.format(*world))
+                return
+            self._ship_start = world
+            self.ax.plot(*world, marker='o', markersize=8, markerfacecolor='none',
+                         markeredgecolor='#333333', linestyle='None', zorder=6)
+            self.canvas.draw_idle()
+            self._set_status('Ship start ({:.1f}, {:.1f}) - now click its goal'.format(*world))
+            return
+        try:
+            self.session.add_obstacle(self._ship_start, world)
+        except ScenarioError as error:
+            self._fail(error)        # the start stays; click another goal
+            return
+        self._log('Ship placed by hand: ({:.2f}, {:.2f}) -> ({:.2f}, {:.2f})'.format(
+            self._ship_start[0], self._ship_start[1], world[0], world[1]))
+        self._ship_start = None
+        self._refresh_after_change()
+        self._set_status('Placed ship {} - click the next ship\'s start'.format(
+            len(self.session.scenario['dyn'])))
+
+    def remove_last_ship(self):
+        self._ship_start = None
+        if self.session.remove_obstacle() is None:
+            self._set_status('No obstacle ships to remove', error=True)
+            return
+        self._refresh_after_change()
+        self._set_status('Removed the last ship - {} left'.format(len(self.session.scenario['dyn'])))
 
     def plan_route(self):
         try:

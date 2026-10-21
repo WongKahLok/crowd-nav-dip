@@ -317,3 +317,46 @@ def test_model_folders_are_checked_and_found(tmp_path):
     # a session that has to load the weights says what is missing before trying
     with pytest.raises(ScenarioError, match='weights'):
         ScenarioSession(str(tmp_path / 'a_no_weights'))
+
+
+def test_add_obstacle_places_a_ship_with_its_own_water_route(session, tmp_path):
+    plan(session, tmp_path, blocks=[(20, 20, 30, 30)])      # an island mid-map
+    with pytest.raises(ScenarioError, match='Plan a route first'):
+        ScenarioSession(str(MODEL_DIR), policy=FixedPolicy()).add_obstacle((40, 10), (10, 40))
+    session.generate_obstacles(2, 7)
+    ship = session.add_obstacle((40.0, 10.0), (10.0, 40.0))  # across the island's corner
+    assert session.scenario['dyn'][-1] is ship and len(session.scenario['dyn']) == 3
+    assert ship['path'][0] == pytest.approx((40.0, 10.0)) and len(ship['path']) >= 2
+    assert all(not session.sim_grid.is_on_land(p) for p in ship['path'])
+    assert session.obstacle_table()[-1] == (40.0, 10.0, 10.0, 40.0)
+    # placed by hand, so the scenario no longer has a seed
+    assert session.last_seed is None and session.last_requested == 3
+    result = session.run_episode(max_steps=2)
+    assert result.context['seed'] == '' and result.context['requested_ships'] == 3
+    assert len(result.states[0][1]) == 3
+
+
+def test_add_obstacle_refuses_land_and_the_own_ship(session, tmp_path):
+    plan(session, tmp_path, blocks=[(20, 20, 30, 30)])
+    # image block rows 20-29 are world y 20-29 flipped: the island spans y 20..30
+    with pytest.raises(ScenarioError, match='Ship start .* is land'):
+        session.add_obstacle((25.5, 25.5), (40.0, 10.0))
+    with pytest.raises(ScenarioError, match='Ship goal .* is land'):
+        session.add_obstacle((40.0, 10.0), (25.5, 25.5))
+    with pytest.raises(ScenarioError, match='within 1 m of your start'):
+        session.add_obstacle((5.8, 5.5), (40.0, 10.0))
+    with pytest.raises(ScenarioError, match='within 1 m of your goal'):
+        session.add_obstacle((40.0, 10.0), (44.5, 44.0))
+    with pytest.raises(ScenarioError, match='too close to its start'):
+        session.add_obstacle((40.0, 10.0), (40.3, 10.0))
+    assert session.scenario['dyn'] == []
+
+
+def test_remove_obstacle_takes_off_the_last_ship(session, tmp_path):
+    plan(session, tmp_path)
+    assert session.remove_obstacle() is None
+    first = session.add_obstacle((40.0, 10.0), (10.0, 40.0))
+    second = session.add_obstacle((30.0, 5.0), (30.0, 40.0))
+    session.run_episode(max_steps=1)
+    assert session.remove_obstacle() is second
+    assert session.scenario['dyn'] == [first] and session.result is None

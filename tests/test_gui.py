@@ -270,3 +270,48 @@ def test_loading_another_model_keeps_the_map_and_clears_the_scenario(qapp, tmp_p
         assert app.session.model_dir == str(other), 'a bad folder leaves the model alone'
     finally:
         app.close()
+
+
+def test_two_clicks_place_an_obstacle_ship(qapp, tmp_path):
+    app = new_window(qapp, tmp_path, blocks=[(20, 20, 30, 30)])
+    try:
+        assert not app.ship_radio.isEnabled() and not app.remove_ship_button.isEnabled()
+        click(app, 5.5, 5.5)
+        click(app, 44.5, 44.5)
+        assert app.ship_radio.isEnabled()
+        app.ship_radio.setChecked(True)
+        assert app.mode == 'ship'
+
+        click(app, 25.5, 25.5)                         # the island
+        assert 'is land' in app.status.text() and app._ship_start is None
+        click(app, 40.0, 10.0)
+        assert app._ship_start == (40.0, 10.0)
+        assert 'now click its goal' in app.status.text()
+        assert app.obstacle_table.rowCount() == 0
+        click(app, 10.0, 40.0)
+        assert app._ship_start is None
+        assert app.obstacle_table.rowCount() == 1
+        assert app.placed_label.text() == 'Placed 1 by hand'
+        assert app.remove_ship_button.isEnabled() and app.mode == 'ship'
+
+        click(app, 30.0, 5.0)                          # a second ship, abandoned half way
+        app.start_radio.setChecked(True)
+        assert app._ship_start is None and app.obstacle_table.rowCount() == 1
+
+        app.remove_last_ship()
+        assert app.obstacle_table.rowCount() == 0 and not app.remove_ship_button.isEnabled()
+    finally:
+        app.close()
+
+
+def test_losing_the_route_leaves_ship_placing_mode(app):
+    click(app, 5.5, 5.5)
+    click(app, 44.5, 44.5)
+    app.ship_radio.setChecked(True)
+    click(app, 40.0, 10.0)
+    click(app, 10.0, 40.0)
+    assert app.obstacle_table.rowCount() == 1
+    app.session.invalidate()                           # what a new start or goal does
+    app._refresh_after_change()
+    assert app.start_radio.isChecked() and app.mode == 'start'
+    assert not app.ship_radio.isEnabled() and not app.remove_ship_button.isEnabled()
