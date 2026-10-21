@@ -315,3 +315,43 @@ def test_losing_the_route_leaves_ship_placing_mode(app):
     app._refresh_after_change()
     assert app.start_radio.isChecked() and app.mode == 'start'
     assert not app.ship_radio.isEnabled() and not app.remove_ship_button.isEnabled()
+
+
+def test_policy_choice_keeps_the_scenario(qapp, tmp_path):
+    from crowd_nav.gui import POLICIES
+    chosen = []
+
+    def builder(name):
+        chosen.append(name)
+        if name == 'broken':
+            raise ScenarioError('weights do not fit')
+        return FixedPolicy()
+
+    from crowd_nav.session import ScenarioError
+    session = ScenarioSession(str(MODEL_DIR), policy=FixedPolicy())
+    app = NavigatorApp(session, map_paths=[], policy_builder=builder)
+    try:
+        assert [app.policy_combo.itemData(i) for i in range(app.policy_combo.count())] == \
+            [name for name, _ in POLICIES]
+        assert app.policy_combo.currentData() == 'sarl'
+        assert app._load_map_file(str(write_map(tmp_path / 'map.png')))
+        click(app, 5.5, 5.5)
+        click(app, 44.5, 44.5)
+        app.session.generate_obstacles(2, 3)
+        app.session.run_episode(max_steps=2)
+
+        assert app.load_policy('sarl_colregs')
+        assert chosen == ['sarl_colregs'] and app.session is session
+        assert app.session.policy_name == 'sarl_colregs'
+        assert app.policy_combo.currentData() == 'sarl_colregs'
+        assert app.session.state == 'obstacles', 'same route and ships, no run'
+        assert app.obstacle_table.rowCount() == 2
+        assert not app.export_results_button.isEnabled()
+        assert 'run again to compare' in app.status.text()
+
+        assert app.load_policy('sarl_colregs') and chosen == ['sarl_colregs'], 'no reload'
+        assert not app.load_policy('broken')
+        assert 'weights do not fit' in app.status.text()
+        assert app.policy_combo.currentData() == 'sarl_colregs', 'the list shows what sails'
+    finally:
+        app.close()

@@ -360,3 +360,30 @@ def test_remove_obstacle_takes_off_the_last_ship(session, tmp_path):
     session.run_episode(max_steps=1)
     assert session.remove_obstacle() is second
     assert session.scenario['dyn'] == [first] and session.result is None
+
+
+def test_set_policy_keeps_the_scenario_and_drops_the_run(session, tmp_path):
+    plan(session, tmp_path)
+    session.generate_obstacles(2, 7)
+    ships = session.obstacle_table()
+    session.run_episode(max_steps=2)
+    other = FixedPolicy()
+    assert session.set_policy('sarl_colregs', policy=other) is other
+    assert session.policy is other and session.robot.policy is other
+    assert session.policy_name == 'sarl_colregs'
+    assert session.state == 'obstacles' and session.obstacle_table() == ships
+    assert session.result is None
+    with pytest.raises(ScenarioError, match='Unknown policy'):
+        session.set_policy('no_such_policy')
+    assert session.policy is other
+
+
+@pytest.mark.slow
+def test_set_policy_loads_sarl_colregs_from_the_model_folder(tmp_path):
+    from crowd_nav.policy.sarl_colregs import SARLColregs
+    session = ScenarioSession(str(MODEL_DIR))
+    plan(session, tmp_path)
+    session.set_policy('sarl_colregs')
+    assert isinstance(session.policy, SARLColregs) and session.policy.env is session.env
+    result = session.run_episode(max_steps=3)
+    assert result.context['policy'] == 'SARL-COLREGs'

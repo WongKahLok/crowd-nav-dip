@@ -309,6 +309,37 @@ class ScenarioSession(object):
         self.last_requested = n
         return obstacles
 
+    # ----------------------------------------------------------------- policy
+
+    def set_policy(self, policy_name, policy=None):
+        """Sail with another policy of the same model folder; the scenario is kept.
+
+        The map, start, goal, route and obstacle ships stay, so two policies can sail the
+        same scenario; only the last episode is dropped. ``policy`` injects a ready-made
+        one (tests); otherwise it is built and loaded like the first.
+        """
+        if policy is None:
+            import torch
+            from crowd_nav import evaluate
+            from crowd_nav.policy.policy_factory import policy_factory
+            if policy_name not in policy_factory:
+                raise ScenarioError('Unknown policy: {}'.format(policy_name))
+            device = torch.device('cpu') if self.device is None else torch.device(self.device)
+            try:
+                policy = evaluate.build_policy(
+                    SimpleNamespace(policy=policy_name, model_dir=self.model_dir,
+                                    policy_config='policy.config', il=False), device)
+            except Exception as exc:     # weights that do not fit this policy's network
+                raise ScenarioError('Could not load {} from {}: {}'.format(
+                    policy_name, self.model_dir, exc))
+        self.policy = policy
+        self.policy_name = policy_name
+        if self.robot is not None:
+            self.robot.set_policy(policy)
+            policy.set_env(self.env)
+        self.result = None
+        return policy
+
     # an obstacle ship placed by hand keeps at least this far from the own ship's start and
     # goal, so it does not begin or end the episode in contact (as the generator's min_dist)
     MIN_OBSTACLE_GAP = 1.0

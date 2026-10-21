@@ -2,6 +2,8 @@
 
     python -m crowd_nav.gui [--model_dir DIR] [--map PNG] [--gpu] [--colregs]
 
+``--colregs`` starts with SARL + COLREGs; the Policy choice in the window switches.
+
 The window is one matplotlib axes that doubles as a click target and a playback screen,
 a scrolling panel of controls on the right, and a log at the bottom. Everything that
 touches the simulation goes through :class:`crowd_nav.session.ScenarioSession`; this
@@ -34,6 +36,8 @@ from crowd_nav.session import ScenarioError, ScenarioSession, find_model_dirs, m
 # this file is <repo>/crowd_nav/gui.py, so the repository root is two levels up
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_ROOT = os.path.join(REPO_ROOT, 'crowd_nav', 'data')
+# the policies the window offers: policy_factory name, label
+POLICIES = [('sarl', 'SARL'), ('sarl_colregs', 'SARL + COLREGs')]
 DEFAULT_MODEL_DIR = os.path.join(MODEL_ROOT, 'output-trained')
 STATIC_MAP_DIR = os.path.join(REPO_ROOT, 'static_maps')
 
@@ -176,12 +180,15 @@ class NavigatorApp(QMainWindow):
     """The window: control panel on the right, map/playback on the left, log at the bottom."""
 
     def __init__(self, session, map_paths=(), parent=None, model_root=MODEL_ROOT,
-                 session_factory=None):
+                 session_factory=None, policy_builder=None):
         """``session_factory(model_dir)`` builds the session for another model folder;
-        by default a ScenarioSession with the current session's settings."""
+        by default a ScenarioSession with the current session's settings.
+        ``policy_builder(name)`` returns a ready policy for the Policy choice; by default
+        the session loads it from its model folder."""
         super().__init__(parent)
         self.session = session
         self._session_factory = session_factory or self._session_like_current
+        self._policy_builder = policy_builder
         self.worker = None
         self._running = False
         self._closing = False
@@ -264,6 +271,15 @@ class NavigatorApp(QMainWindow):
         row.addWidget(self.model_combo, 1)
         row.addWidget(self.model_browse_button)
         row.addWidget(self.model_load_button)
+        layout.addLayout(row)
+        self.policy_combo = QComboBox()
+        for name, label in POLICIES:
+            self.policy_combo.addItem(label, name)
+        self.policy_combo.setToolTip('SARL + COLREGs filters the actions by the steering '
+                                     'rules (Rules 13-17). Switching keeps the scenario.')
+        self.policy_combo.activated.connect(self._on_policy_chosen)
+        row = QFormLayout()
+        row.addRow('Policy', self.policy_combo)
         layout.addLayout(row)
         self.model_label = QLabel('No model loaded')
         self.model_label.setWordWrap(True)
@@ -478,6 +494,7 @@ class NavigatorApp(QMainWindow):
         self.model_combo.setEnabled(not running)
         self.model_browse_button.setEnabled(not running)
         self.model_load_button.setEnabled(not running)
+        self.policy_combo.setEnabled(not running)
         self.browse_button.setEnabled(not running)
         self.map_combo.setEnabled(not running)
         self.start_radio.setEnabled(not running and state != 'no_map')
@@ -616,6 +633,41 @@ class NavigatorApp(QMainWindow):
         self.model_label.setText('Model {} ({})'.format(
             os.path.basename(os.path.normpath(self.session.model_dir)),
             getattr(self.session.policy, 'name', self.session.policy_name)))
+        index = self.policy_combo.findData(self.session.policy_name)
+        if index < 0:     # a policy started from the command line that the list lacks
+            self.policy_combo.addItem(self.session.policy_name, self.session.policy_name)
+            index = self.policy_combo.count() - 1
+        self.policy_combo.setCurrentIndex(index)
+
+    def _on_policy_chosen(self, index):
+        self.load_policy(self.policy_combo.itemData(index))
+
+    def load_policy(self, name):
+        """Switch the policy; the map, start, goal, route and ships stay."""
+        if self._is_running():
+            return False
+        if name == self.session.policy_name:
+            return True
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            policy = None if self._policy_builder is None else self._policy_builder(name)
+            self.session.set_policy(name, policy=policy)
+        except ScenarioError as error:
+            self._fail(error)
+            self._show_model()       # the list goes back to the policy still in use
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._stop_playback()
+        self._show_model()
+        self._log('Policy {}'.format(getattr(self.session.policy, 'name', name)))
+        if self.session.plan_grid is not None:
+            self._refresh_after_change()          # the scenario stays, the old run goes
+        else:
+            self._sync_widgets()
+        self._set_status('Sailing with {} - run again to compare'.format(
+            self.policy_combo.currentText()))
+        return True
 
     def _browse_model(self):
         path = QFileDialog.getExistingDirectory(self, 'Choose a trained model folder', MODEL_ROOT)
@@ -998,6 +1050,7 @@ def main(argv=None):
     try:
         session = ScenarioSession(model_dir, safety_distance=args.safety_distance,
                                   colregs=args.colregs,
+                                  policy_name='sarl_colregs' if args.colregs else 'sarl',
                                   device='cuda:0' if args.gpu else 'cpu')
     except Exception as error:
         QMessageBox.critical(None, 'CrowdNav', 'Could not load the policy:\n{}\n\n{}'.format(
