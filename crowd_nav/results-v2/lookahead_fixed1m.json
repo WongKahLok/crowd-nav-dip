@@ -1,7 +1,7 @@
 {
   "experiment": "lookahead_fixed1m",
   "policy": "sarl",
-  "model": "output-trained",
+  "model": "output-sarl",
   "settings": [
     "--env_set",
     "robot.visible=true",
@@ -32,12 +32,12 @@
     "min_turn": 5.0,
     "trips": "every trip"
   },
-  "started": "2026-10-21 23:24:43",
-  "minutes": 12.8,
+  "started": "2026-10-26 00:30:52",
+  "minutes": 9.4,
   "jobs": 15,
-  "commit": "51093d0",
+  "commit": "42707ac",
   "local_changes": true,
-  "weights_sha256": "f8240c0c73fe0859",
+  "weights_sha256": "bba5d2723690a39b",
   "python": "3.10.20",
   "torch": "2.8.0+cu126"
 }

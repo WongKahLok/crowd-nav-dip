@@ -1,7 +1,7 @@
 {
   "experiment": "perception_r0m",
   "policy": "sarl",
-  "model": "output-trained",
+  "model": "output-sarl",
   "settings": [
     "--env_set",
     "robot.visible=true",
@@ -30,12 +30,12 @@
     "min_turn": 5.0,
     "trips": "every trip"
   },
-  "started": "2026-10-21 22:44:09",
-  "minutes": 13.4,
+  "started": "2026-10-25 23:59:01",
+  "minutes": 9.5,
   "jobs": 15,
-  "commit": "51093d0",
+  "commit": "42707ac",
   "local_changes": true,
-  "weights_sha256": "f8240c0c73fe0859",
+  "weights_sha256": "bba5d2723690a39b",
   "python": "3.10.20",
   "torch": "2.8.0+cu126"
 }
