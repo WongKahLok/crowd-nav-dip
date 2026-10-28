@@ -355,3 +355,47 @@ def test_policy_choice_keeps_the_scenario(qapp, tmp_path):
         assert app.policy_combo.currentData() == 'sarl_colregs', 'the list shows what sails'
     finally:
         app.close()
+
+
+# ----------------------------------------------------------------- theme
+
+def test_dark_theme_recolours_the_map_and_survives_a_redraw(qapp, tmp_path):
+    from matplotlib.colors import same_color
+    from crowd_nav.gui import THEMES
+    session = ScenarioSession(str(MODEL_DIR), policy=FixedPolicy())
+    app = NavigatorApp(session, map_paths=[], theme='dark')
+    try:
+        assert app._load_map_file(str(write_map(tmp_path / 'map.png')))
+        click(app, 5.5, 5.5)
+        click(app, 44.5, 44.5)                      # route drawn in the theme's ink
+        dark = THEMES['dark']
+        assert same_color(app.ax.get_facecolor(), dark['water'])
+        assert same_color(app.fig.get_facecolor(), dark['figure'])
+        assert any(same_color(line.get_color(), dark['ink']) for line in app.ax.lines)
+
+        app.set_theme('light')
+        light = THEMES['light']
+        assert same_color(app.ax.get_facecolor(), light['water'])
+        assert not any(same_color(line.get_color(), dark['ink']) for line in app.ax.lines)
+    finally:
+        app.close()
+
+
+def test_system_theme_is_followed_while_the_window_is_open(qapp, monkeypatch):
+    import crowd_nav.gui as gui
+    monkeypatch.setattr(gui, 'system_theme', lambda: 'light')
+    session = ScenarioSession(str(MODEL_DIR), policy=FixedPolicy())
+    app = NavigatorApp(session, map_paths=[])
+    try:
+        assert app.theme_name == 'light' and app._theme_timer.isActive()
+        monkeypatch.setattr(gui, 'system_theme', lambda: 'dark')
+        app._follow_system_theme()                  # what the timer does every 2 s
+        assert app.theme_name == 'dark'
+        assert 'dark theme' in app.log.toPlainText()
+    finally:
+        app.close()
+    fixed = NavigatorApp(session, map_paths=[], theme='light')
+    try:
+        assert not fixed._theme_timer.isActive(), 'a chosen theme is not overridden'
+    finally:
+        fixed.close()

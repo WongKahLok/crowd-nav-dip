@@ -12,6 +12,7 @@ than a stack trace in the terminal.
 """
 import argparse
 import glob
+import html
 import os
 import sys
 import threading
@@ -20,13 +21,17 @@ import traceback
 
 # torch must load before PyQt5 on Windows, otherwise c10.dll fails with WinError 1114
 import torch  # noqa: F401
+import numpy as np
+from matplotlib import rcParams
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
-from matplotlib.colors import ListedColormap
+from matplotlib.colors import ListedColormap, same_color
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from PIL import Image
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QPalette
 from PyQt5.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-                             QFormLayout, QGroupBox, QHBoxLayout, QLabel, QMainWindow,
+                             QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
                              QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
                              QRadioButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
                              QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
@@ -45,6 +50,128 @@ MAP_SIZE = 50.0
 SPEEDS = [0.5, 1.0, 2.0, 4.0]
 PLAY_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b',
                '#e377c2', '#7f7f7f', '#bcbd22', '#17becf', '#aec7e8', '#ffbb78']
+
+# playback ship marker: a pointed hull facing +x, rotated to the heading every frame
+SHIP_SHAPE = np.array([(1.0, 0.0), (-0.7, 0.6), (-0.35, 0.0), (-0.7, -0.6), (1.0, 0.0)])
+OWN_SHIP_COLOR = '#ffd400'
+OWN_SHIP_SIZE = 16
+SHIP_SIZE = 11
+TRAIL_FRAMES = 40           # 10 s of wake at the 0.25 s time step
+PLAYBACK_BOTTOM = 0.2       # figure margin below the axes for the playback legend
+
+# Results panel: how each metric is shown. Exports keep the full-precision values.
+METRIC_FORMATS = {
+    'sim_time': '{:.1f} s', 'travelled_dist': '{:.2f} m', 'planned_dist': '{:.2f} m',
+    'detour_ratio': '{:.3f}×', 'min_sep_dynamic': '{:.2f} m', 'min_sep_static': '{:.2f} m',
+}
+PERCENT_METRICS = ('danger_frac', 'emergency_frac')
+
+# Light and dark themes for the widgets, the log and the map canvas. 'ink' is the colour
+# of axes, labels, the route and the time; 'water' is the map's background.
+THEMES = {
+    'light': {
+        'figure': 'white', 'water': 'white', 'ink': 'black',
+        'warning': '#b26a00', 'error': '#b00020', 'detail': '#777777', 'stamp': '#888888',
+        'primary_disabled_bg': '#cfd8dc', 'primary_disabled_fg': '#eceff1',
+    },
+    'dark': {
+        'figure': '#1e1e1e', 'water': '#14232e', 'ink': '#e0e0e0',
+        'warning': '#ffb74d', 'error': '#ff6b6b', 'detail': '#9e9e9e', 'stamp': '#8a8a8a',
+        'primary_disabled_bg': '#3a4a52', 'primary_disabled_fg': '#7d8f99',
+    },
+}
+THEME_POLL_MS = 2000        # how often the window checks the Windows light/dark setting
+
+# the buttons that move the scenario on to its next stage
+PRIMARY_BUTTON_STYLE = """
+QPushButton[primary="true"] {{
+    background: #1565c0; color: white; font-weight: 600;
+    border: none; border-radius: 4px; padding: 5px 10px;
+}}
+QPushButton[primary="true"]:hover {{ background: #1976d2; }}
+QPushButton[primary="true"]:pressed {{ background: #0d47a1; }}
+QPushButton[primary="true"]:disabled {{ background: {primary_disabled_bg}; color: {primary_disabled_fg}; }}
+"""
+
+
+def system_theme():
+    """'dark' when Windows apps are set to dark mode, otherwise (and off Windows) 'light'."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r'Software\Microsoft\Windows\CurrentVersion\Themes\Personalize') as key:
+            value, _ = winreg.QueryValueEx(key, 'AppsUseLightTheme')
+    except (ImportError, OSError):
+        return 'light'
+    return 'light' if value else 'dark'
+
+
+def dark_palette():
+    """A dark palette for the Fusion style."""
+    text, disabled = QColor('#e0e0e0'), QColor('#7a7a7a')
+    palette = QPalette()
+    for role, color in ((QPalette.Window, '#2b2b2b'), (QPalette.Base, '#1e1e1e'),
+                        (QPalette.AlternateBase, '#2b2b2b'), (QPalette.Button, '#353535'),
+                        (QPalette.ToolTipBase, '#3c3c3c'), (QPalette.Highlight, '#2a82da'),
+                        (QPalette.Link, '#64b5f6'), (QPalette.BrightText, '#ff6b6b')):
+        palette.setColor(role, QColor(color))
+    for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText, QPalette.ToolTipText):
+        palette.setColor(role, text)
+        palette.setColor(QPalette.Disabled, role, disabled)
+    palette.setColor(QPalette.HighlightedText, QColor('white'))
+    palette.setColor(QPalette.PlaceholderText, disabled)
+    return palette
+
+
+def format_metric(key, value):
+    """One Results value as shown in the panel: rounded, with its unit."""
+    if value == '' or value is None:
+        return '—'
+    try:
+        if key in PERCENT_METRICS:
+            return '{:.1f} %'.format(100 * float(value))
+        if key in METRIC_FORMATS:
+            return METRIC_FORMATS[key].format(float(value))
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
+
+# log and status bar: warnings are things to adjust or retry, errors are failures; their
+# colours come from the theme
+LOG_PREFIXES = {'warning': 'Warning: ', 'error': 'Error: '}
+
+
+# One look on every platform: Qt's Fusion style, and one font for the widgets and the
+# map canvas. Segoe UI ships with Windows; elsewhere Qt and matplotlib fall back to the
+# system sans-serif.
+UI_FONT = 'Segoe UI'
+UI_FONT_SIZE = 9
+PANEL_MIN_WIDTH = 400       # px; keeps the model and map names readable in their dropdowns
+
+
+def apply_style(app):
+    """Fusion style and a single font for the window and the matplotlib canvas."""
+    app.setStyle('Fusion')
+    font = QFont(UI_FONT, UI_FONT_SIZE)
+    font.setStyleHint(QFont.SansSerif)
+    app.setFont(font)
+    rcParams['font.family'] = 'sans-serif'
+    rcParams['font.sans-serif'] = [UI_FONT, 'DejaVu Sans']
+
+
+def fit_combo(combo, chars=14):
+    """Let a file-name dropdown shrink to ``chars`` characters instead of growing to its
+    longest name, which would widen the whole panel; the tooltip has the full path."""
+    combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+    combo.setMinimumContentsLength(chars)
+
+
+def set_item_tooltips(combo, paths):
+    """Full path as each item's tooltip; the narrow panel cuts long file names short."""
+    for i, path in enumerate(paths):
+        combo.setItemData(i, os.path.abspath(path), Qt.ToolTipRole)
+
 
 LAND_CMAP = ListedColormap([(0.0, 0.0, 0.0, 0.0), (0.45, 0.45, 0.45, 1.0)])
 MARGIN_CMAP = ListedColormap([(0.0, 0.0, 0.0, 0.0), (0.95, 0.55, 0.15, 0.35)])
@@ -99,6 +226,36 @@ class MapView(object):
         self.session = None
         self.scene = None
         self.show_source = False
+        self.theme = THEMES['light']
+
+    def apply_theme(self):
+        """Recolour the figure for ``self.theme``. Anything drawn in the ink of either theme
+        (axes, labels, the route, the playback time) takes this theme's ink; coloured
+        markers keep their colours."""
+        theme, ax = self.theme, self.ax
+        inks = [t['ink'] for t in THEMES.values()]
+
+        def is_ink(color):
+            return any(same_color(color, ink) for ink in inks)
+
+        self.fig.set_facecolor(theme['figure'])
+        ax.set_facecolor(theme['water'])
+        for spine in ax.spines.values():
+            spine.set_edgecolor(theme['ink'])
+        ax.tick_params(colors=theme['ink'], which='both')
+        ax.xaxis.label.set_color(theme['ink'])
+        ax.yaxis.label.set_color(theme['ink'])
+        for line in ax.lines:
+            if is_ink(line.get_color()):
+                line.set_color(theme['ink'])
+        for text in ax.texts:
+            if is_ink(text.get_color()):
+                text.set_color(theme['ink'])
+        legend = ax.get_legend()
+        if legend is not None:
+            for text in legend.get_texts():
+                text.set_color(theme['ink'])
+        self.canvas.draw_idle()
 
     # ------------------------------------------------------------------ base
 
@@ -107,6 +264,7 @@ class MapView(object):
         self.scene = None
         ax = self.ax
         ax.clear()
+        self.fig.subplots_adjust(bottom=rcParams['figure.subplot.bottom'])
         if self.show_source and session.map_path and os.path.exists(session.map_path):
             ax.imshow(Image.open(session.map_path), origin='upper', cmap='gray',
                       extent=(0, MAP_SIZE, 0, MAP_SIZE), alpha=0.35, zorder=0)
@@ -124,7 +282,7 @@ class MapView(object):
         self.draw_markers(session)
         self.draw_route(session)
         self.draw_obstacles(session)
-        self.canvas.draw_idle()
+        self.apply_theme()
 
     def draw_markers(self, session):
         if session.start_centre is not None:
@@ -166,25 +324,98 @@ class MapView(object):
         from crowd_sim.envs.render import EpisodeAnimation
         self.ax.clear()
         self.scene = EpisodeAnimation(result.render_env(), self.ax)
-        self.canvas.draw_idle()
+        self._style_ships()
+        self._update_ships(0)
+        self.apply_theme()
         return self.scene
 
     def set_frame(self, k):
         if self.scene is None:
             return
         self.scene.update(k)
+        self._update_ships(k)
         self.canvas.draw_idle()
+
+    def _style_ships(self):
+        """Draw every ship as a heading-shaped marker with a short trail.
+
+        The scene's circles are true to scale (0.3 m), a few pixels on a 50 m map, so
+        they are hidden and fixed-size markers on top carry the position and heading.
+        """
+        scene, ax = self.scene, self.ax
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
+        scene.robot.set_visible(False)
+        for human in scene.humans:
+            human.set_visible(False)
+        for ring in (scene.robot_outer, scene.robot_detector):
+            ring.set_alpha(0.6)
+        colors = [OWN_SHIP_COLOR] + [PLAY_COLORS[i % len(PLAY_COLORS)]
+                                     for i in range(len(scene.humans))]
+        self.trails = [ax.plot([], [], '-', color=c, linewidth=2.5 if i == 0 else 1.5,
+                               alpha=0.6, solid_capstyle='round', zorder=7)[0]
+                       for i, c in enumerate(colors)]
+        self.ships = [ax.plot([], [], linestyle='None', marker=SHIP_SHAPE,
+                              markersize=OWN_SHIP_SIZE if i == 0 else SHIP_SIZE,
+                              markerfacecolor=c, markeredgecolor='black',
+                              markeredgewidth=1.0 if i == 0 else 0.6, zorder=8)[0]
+                      for i, c in enumerate(colors)]
+        handles = [
+            Line2D([], [], linestyle='None', marker='o', markersize=9,
+                   markerfacecolor=OWN_SHIP_COLOR, markeredgecolor='black', label='Own ship'),
+            Line2D([], [], linestyle='None', marker='o', markersize=7,
+                   markerfacecolor=PLAY_COLORS[0], markeredgecolor='black',
+                   label='Other ships'),
+            Line2D([], [], linestyle='None', marker='*', markersize=11, color='red',
+                   label='Goal'),
+            Line2D([], [], linestyle='None', marker='o', markersize=5, color='m',
+                   label='Steering target'),
+            Line2D([], [], linestyle='--', color='m', alpha=0.6, label='Distance to target'),
+            Line2D([], [], linestyle='--', color='orange', alpha=0.6,
+                   label='Detection range'),
+        ]
+        ax.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, -0.1), ncol=3,
+                  fontsize=9, frameon=False)
+        self.fig.subplots_adjust(bottom=PLAYBACK_BOTTOM)      # room for the legend
+
+    def _positions(self, agent):
+        scene = self.scene
+        if agent == 0:
+            return scene.robot_positions
+        return [frame[agent - 1] for frame in scene.human_positions]
+
+    def _heading(self, agent, k):
+        """Smoothed heading from the scene's arrows; from the motion when it has none."""
+        scene = self.scene
+        if agent < len(scene.orientations):
+            (x0, y0), (x1, y1) = scene.orientations[agent][k]
+        else:
+            positions = self._positions(agent)
+            (x0, y0) = positions[max(k - 1, 0)]
+            (x1, y1) = positions[min(max(k, 1), len(positions) - 1)]
+        return np.arctan2(y1 - y0, x1 - x0)
+
+    def _update_ships(self, k):
+        for agent, (ship, trail) in enumerate(zip(self.ships, self.trails)):
+            positions = self._positions(agent)
+            tail = positions[max(0, k - TRAIL_FRAMES):k + 1]
+            trail.set_data([p[0] for p in tail], [p[1] for p in tail])
+            ship.set_data([positions[k][0]], [positions[k][1]])
+            theta = self._heading(agent, k)
+            c, s = np.cos(theta), np.sin(theta)
+            ship.set_marker(SHIP_SHAPE @ np.array([[c, s], [-s, c]]))
 
 
 class NavigatorApp(QMainWindow):
     """The window: control panel on the right, map/playback on the left, log at the bottom."""
 
     def __init__(self, session, map_paths=(), parent=None, model_root=MODEL_ROOT,
-                 session_factory=None, policy_builder=None):
+                 session_factory=None, policy_builder=None, theme='system'):
         """``session_factory(model_dir)`` builds the session for another model folder;
         by default a ScenarioSession with the current session's settings.
         ``policy_builder(name)`` returns a ready policy for the Policy choice; by default
-        the session loads it from its model folder."""
+        the session loads it from its model folder. ``theme`` is 'system' (follow
+        Windows), 'light' or 'dark'."""
         super().__init__(parent)
         self.session = session
         self._session_factory = session_factory or self._session_like_current
@@ -229,8 +460,19 @@ class NavigatorApp(QMainWindow):
         self.status = QLabel('Ready')
         self.statusBar().addWidget(self.status)
 
+        # ---- theme: 'system' keeps following the Windows light/dark setting ----
+        self._status_level = 'info'
+        self._theme_timer = QTimer(self)
+        self._theme_timer.timeout.connect(self._follow_system_theme)
+        if theme == 'system':
+            self.set_theme(system_theme())
+            self._theme_timer.start(THEME_POLL_MS)
+        else:
+            self.set_theme(theme)
+
         self.map_combo.addItems([os.path.basename(p) for p in map_paths])
         self._map_paths = list(map_paths)
+        set_item_tooltips(self.map_combo, self._map_paths)
         self._sync_widgets()
         self._model_paths = []
         for path in find_model_dirs(model_root) + [session.model_dir]:
@@ -238,6 +480,7 @@ class NavigatorApp(QMainWindow):
         self.model_combo.setCurrentIndex(self._model_index(session.model_dir))
         self._show_model()
         self._log('Model directory {}'.format(session.model_dir))
+        self._fit_panel()                   # now that the dropdowns hold their names
 
     # ----------------------------------------------------------- construction
 
@@ -252,16 +495,31 @@ class NavigatorApp(QMainWindow):
         layout.addWidget(self._build_result_group())
         layout.addWidget(self._build_export_group())
         layout.addStretch(1)
+        for button in (self.plan_button, self.generate_button, self.run_button):
+            button.setProperty('primary', True)
+        self.panel = panel                  # restyled by set_theme
         scroll = QScrollArea()
         scroll.setWidget(panel)
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(340)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.panel_scroll = scroll
+        self._fit_panel()
         return scroll
+
+    def _fit_panel(self):
+        """Wide enough for the widest section next to the vertical scroll bar, so the panel
+        only ever scrolls up and down. Rerun after a style change, which moves widths."""
+        scroll = self.panel_scroll
+        self.panel.ensurePolished()
+        scroll.setMinimumWidth(max(PANEL_MIN_WIDTH, self.panel.minimumSizeHint().width()
+                                   + scroll.verticalScrollBar().sizeHint().width()
+                                   + 2 * scroll.frameWidth()))
 
     def _build_map_group(self):
         group = QGroupBox('1. Model and map')
         layout = QVBoxLayout(group)
         self.model_combo = QComboBox()
+        fit_combo(self.model_combo)
         self.model_combo.setToolTip('Trained model folders: env.config, policy.config and weights')
         self.model_browse_button = QPushButton('Browse…')
         self.model_load_button = QPushButton('Load')
@@ -285,6 +543,7 @@ class NavigatorApp(QMainWindow):
         self.model_label.setWordWrap(True)
         layout.addWidget(self.model_label)
         self.map_combo = QComboBox()
+        fit_combo(self.map_combo)
         self.browse_button = QPushButton('Browse…')
         self.load_button = QPushButton('Load')
         self.browse_button.clicked.connect(self._browse_map)
@@ -371,22 +630,28 @@ class NavigatorApp(QMainWindow):
         self.generate_button.clicked.connect(self.generate_obstacles)
         layout.addWidget(self.generate_button)
         # a third click mode, exclusive with Set start / Set goal: two clicks per ship
-        self.ship_radio = QRadioButton('Place ship: click its start, then its goal')
-        self.ship_radio.setToolTip('Generating random ships replaces the ones placed by hand')
+        self.ship_radio = QRadioButton('Place ship by hand')
+        self.ship_radio.setToolTip('Click the ship\'s start on the map, then its goal. '
+                                   'Generating random ships replaces the ones placed by hand')
         self.point_group.addButton(self.ship_radio)
         self.ship_radio.toggled.connect(self._on_mode_change)
         self.remove_ship_button = QPushButton('Remove last')
         self.remove_ship_button.clicked.connect(self.remove_last_ship)
+        layout.addWidget(self.ship_radio)
+        self.placed_label = QLabel('Placed 0 / 0')
         row = QHBoxLayout()
-        row.addWidget(self.ship_radio, 1)
+        row.addWidget(self.placed_label, 1)
         row.addWidget(self.remove_ship_button)
         layout.addLayout(row)
-        self.placed_label = QLabel('Placed 0 / 0')
-        layout.addWidget(self.placed_label)
         self.obstacle_table = QTableWidget(0, 4)
-        self.obstacle_table.setHorizontalHeaderLabels(['px', 'py', 'gx', 'gy'])
+        self.obstacle_table.setHorizontalHeaderLabels(['start x', 'start y', 'goal x', 'goal y'])
         self.obstacle_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.obstacle_table.setMaximumHeight(150)
+        # four equal columns that fit the panel, so the table never scrolls sideways
+        self.obstacle_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.obstacle_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.obstacle_table.verticalHeader().setDefaultSectionSize(22)
+        self.obstacle_table.verticalHeader().setMinimumWidth(24)
         layout.addWidget(self.obstacle_table)
         return group
 
@@ -447,6 +712,7 @@ class NavigatorApp(QMainWindow):
                            ('min_sep_static', 'min_sep_static'),
                            ('danger_frac', 'danger_frac'), ('emergency_frac', 'emergency_frac')]:
             label = QLabel('—')
+            label.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
             self.result_labels[key] = label
             layout.addRow(title, label)
         return group
@@ -467,14 +733,58 @@ class NavigatorApp(QMainWindow):
 
     # --------------------------------------------------------------- helpers
 
-    def _log(self, message):
-        self.log.appendPlainText(message)
+    def _log(self, message, level='info'):
+        """One timestamped log line; warnings and errors are prefixed and coloured,
+        'detail' (tracebacks) is greyed out under the error it explains."""
+        text = html.escape(LOG_PREFIXES.get(level, '') + str(message))
+        # appendHtml collapses whitespace: keep line breaks and traceback indentation
+        text = text.replace('\n', '<br>').replace('  ', '&nbsp;&nbsp;')
+        theme = THEMES[self.theme_name]
+        if level in theme:
+            text = '<span style="color: {};">{}</span>'.format(theme[level], text)
+        self.log.appendHtml('<span style="color: {};">{}</span>&nbsp;&nbsp;{}'.format(
+            theme['stamp'], time.strftime('%H:%M:%S'), text))
 
-    def _set_status(self, message, error=False):
+    def _set_status(self, message, error=False, level=None):
+        """Show ``message`` in the status bar; warnings and errors also go to the log."""
+        level = level or ('error' if error else 'info')
         self.status.setText(message)
-        self.status.setStyleSheet('color: #b00020;' if error else '')
-        if error:
-            self._log('Error: {}'.format(message))
+        self._status_level = level
+        self._color_status()
+        if level != 'info':
+            self._log(message, level)
+
+    def _color_status(self):
+        theme = THEMES[self.theme_name]
+        self.status.setStyleSheet('color: {};'.format(theme[self._status_level])
+                                  if self._status_level in theme else '')
+
+    # ----------------------------------------------------------------- theme
+
+    def set_theme(self, name):
+        """Switch the widgets, the log colours and the map to the 'light' or 'dark' theme.
+        Lines already in the log keep the colours they were written in."""
+        if name not in THEMES:
+            raise ValueError('Unknown theme {!r}, expected one of {}'.format(name, list(THEMES)))
+        self.theme_name = name
+        theme = THEMES[name]
+        app = QApplication.instance()
+        app.setPalette(dark_palette() if name == 'dark' else app.style().standardPalette())
+        self.panel.setStyleSheet(PRIMARY_BUTTON_STYLE.format(**theme))
+        self._fit_panel()
+        self._color_status()
+        self.view.theme = theme
+        self.view.apply_theme()
+
+    def _follow_system_theme(self):
+        name = system_theme()
+        if name != self.theme_name:
+            self.set_theme(name)
+            self._log('Switched to the {} theme to match Windows'.format(name))
+
+    def _warn(self, message):
+        """Something the user can fix or retry, as opposed to a failure."""
+        self._set_status(message, level='warning')
 
     def _fail(self, error):
         self._set_status(str(error), error=True)
@@ -544,24 +854,37 @@ class NavigatorApp(QMainWindow):
         rows = self.session.obstacle_table()
         self.obstacle_table.setRowCount(len(rows))
         for i, row in enumerate(rows):
+            # the row number in the ship's map colour, so a row is easy to find on the map
+            number = QTableWidgetItem(str(i + 1))
+            number.setForeground(QColor(PLAY_COLORS[i % len(PLAY_COLORS)]))
+            font = number.font()
+            font.setBold(True)
+            number.setFont(font)
+            self.obstacle_table.setVerticalHeaderItem(i, number)
             for j, value in enumerate(row):
-                self.obstacle_table.setItem(i, j, QTableWidgetItem('{:.2f}'.format(value)))
+                item = QTableWidgetItem('{:.1f}'.format(value))
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.obstacle_table.setItem(i, j, item)
         if rows and self.session.last_seed is None:
             self.placed_label.setText('Placed {} by hand'.format(len(rows)))
         else:
             requested = self.count_spin.value() if self.session.route is not None else 0
             self.placed_label.setText('Placed {} / {}'.format(len(rows), requested))
-        for warning in self.session.warnings:
-            self._set_status(warning, error=True)
 
     def _clear_results(self):
         for label in self.result_labels.values():
             label.setText('—')
+        self.result_labels['outcome'].setStyleSheet('')
 
     def _show_results(self, metrics):
         for key, label in self.result_labels.items():
-            value = metrics.get(key, '')
-            label.setText('—' if value == '' else str(value))
+            label.setText(format_metric(key, metrics.get(key, '')))
+        outcome = str(metrics.get('outcome', ''))
+        color = ('#2e7d32' if outcome == 'success' else
+                 '#c62828' if outcome.startswith('collision') else '#ef6c00')
+        self.result_labels['outcome'].setStyleSheet(
+            'background: {}; color: white; font-weight: 600; border-radius: 4px;'
+            ' padding: 2px 8px;'.format(color))
 
     # ------------------------------------------------------------------- map
 
@@ -573,13 +896,14 @@ class NavigatorApp(QMainWindow):
         if path not in self._map_paths:
             self._map_paths.append(path)
             self.map_combo.addItem(os.path.basename(path))
+            set_item_tooltips(self.map_combo, self._map_paths)
         self.map_combo.setCurrentIndex(self._map_paths.index(path))
         self.load_selected_map()
 
     def load_selected_map(self, *_):
         index = self.map_combo.currentIndex()
         if not (0 <= index < len(self._map_paths)):
-            self._set_status('No map to load', error=True)
+            self._warn('No map to load')
             return
         if self._load_map_file(self._map_paths[index]):
             self._log('Loaded map {}'.format(self._map_paths[index]))
@@ -627,6 +951,7 @@ class NavigatorApp(QMainWindow):
         if self._model_index(path) < 0:
             self._model_paths.append(path)
             self.model_combo.addItem(os.path.basename(os.path.normpath(path)))
+            set_item_tooltips(self.model_combo, self._model_paths)
         return self._model_index(path)
 
     def _show_model(self):
@@ -683,7 +1008,7 @@ class NavigatorApp(QMainWindow):
     def load_selected_model(self, *_):
         index = self.model_combo.currentIndex()
         if not (0 <= index < len(self._model_paths)):
-            self._set_status('No model to load', error=True)
+            self._warn('No model to load')
             return
         self.load_model(self._model_paths[index])
 
@@ -705,8 +1030,8 @@ class NavigatorApp(QMainWindow):
             self._fail(error)
             return False
         except Exception as error:      # a folder whose weights do not fit the network
-            self._log(traceback.format_exc())
             self._fail('Could not load the model in {}: {}'.format(path, error))
+            self._log(traceback.format_exc(), 'detail')
             return False
         finally:
             QApplication.restoreOverrideCursor()
@@ -739,14 +1064,14 @@ class NavigatorApp(QMainWindow):
         if getattr(event, 'button', 1) != 1:
             return
         if self._is_running():
-            self._set_status('Episode running - cancel it or wait for it to finish', error=True)
+            self._warn('Episode running - cancel it or wait for it to finish')
             return
         if self.session.plan_grid is None:
-            self._set_status('Load a map first', error=True)
+            self._warn('Load a map first')
             return
         world = ScenarioSession.world_from_click(event.xdata, event.ydata)
         if world is None:
-            self._set_status('That point is off the canvas', error=True)
+            self._warn('That point is off the canvas')
             return
         if self.mode == 'ship':
             self._place_ship_click(world)
@@ -797,7 +1122,7 @@ class NavigatorApp(QMainWindow):
     def remove_last_ship(self):
         self._ship_start = None
         if self.session.remove_obstacle() is None:
-            self._set_status('No obstacle ships to remove', error=True)
+            self._warn('No obstacle ships to remove')
             return
         self._refresh_after_change()
         self._set_status('Removed the last ship - {} left'.format(len(self.session.scenario['dyn'])))
@@ -828,7 +1153,8 @@ class NavigatorApp(QMainWindow):
         if n == 0:
             self._set_status('No obstacle ships - static map only')
         elif len(obstacles) < n:
-            self._set_status('Placed {} / {}'.format(len(obstacles), n), error=True)
+            self._warn('Placed {} of {} obstacle ships - there was no room for the rest. Lower '
+                       'spacing or spawn min, or raise tries / ship'.format(len(obstacles), n))
         else:
             self._set_status('Placed {} obstacle ships (seed {})'.format(len(obstacles), seed))
 
@@ -862,7 +1188,7 @@ class NavigatorApp(QMainWindow):
             torch = None
         if torch is None or not torch.cuda.is_available():
             self.gpu_box.setChecked(False)
-            self._set_status('No CUDA available - falling back to CPU', error=True)
+            self._warn('No CUDA available - falling back to CPU')
             return
         self.session.policy.set_device(torch.device('cuda:0'))
 
@@ -904,7 +1230,7 @@ class NavigatorApp(QMainWindow):
         self.progress.setValue(0)
         self._clear_results()
         self._fail(message.splitlines()[0])
-        self._log(message)
+        self._log(message, 'detail')
         QMessageBox.critical(self, 'Episode failed', message)
         self._sync_widgets()
 
@@ -970,7 +1296,7 @@ class NavigatorApp(QMainWindow):
     def export_video(self):
         result = self.session.result
         if result is None:
-            self._set_status('Nothing to export yet', error=True)
+            self._warn('Nothing to export yet')
             return
         path, _ = QFileDialog.getSaveFileName(self, 'Export video', 'episode.mp4',
                                               'MP4 (*.mp4);;All files (*)')
@@ -990,8 +1316,8 @@ class NavigatorApp(QMainWindow):
         try:
             written = self.session.export_video(result, path, progress=report)
         except Exception as error:
-            self._log(traceback.format_exc())
             self._fail(error)
+            self._log(traceback.format_exc(), 'detail')
         else:
             self.progress.setValue(100)
             self._set_status('Video written to {}'.format(written))
@@ -1004,7 +1330,7 @@ class NavigatorApp(QMainWindow):
         """Save the last episode's results as CSV or JSON; ``path`` skips the dialog."""
         result = self.session.result
         if result is None:
-            self._set_status('Nothing to export yet', error=True)
+            self._warn('Nothing to export yet')
             return
         if path is None:
             path, chosen = QFileDialog.getSaveFileName(
@@ -1027,6 +1353,7 @@ class NavigatorApp(QMainWindow):
     def closeEvent(self, event):
         self._closing = True
         self.timer.stop()
+        self._theme_timer.stop()
         if self.worker is not None and self.worker.isRunning():
             self.worker.cancel()
             if not self.worker.wait(5000):
@@ -1043,9 +1370,12 @@ def main(argv=None):
     parser.add_argument('--gpu', default=False, action='store_true')
     parser.add_argument('--colregs', default=False, action='store_true')
     parser.add_argument('--safety_distance', type=int, default=1)
+    parser.add_argument('--theme', choices=['system'] + list(THEMES), default='system',
+                        help='light or dark; system (default) follows the Windows setting')
     args = parser.parse_args(argv)
 
     app = QApplication.instance() or QApplication(sys.argv[:1])
+    apply_style(app)
     model_dir = args.model_dir or DEFAULT_MODEL_DIR
     try:
         session = ScenarioSession(model_dir, safety_distance=args.safety_distance,
@@ -1058,10 +1388,11 @@ def main(argv=None):
         return 1
 
     maps = sorted(glob.glob(os.path.join(STATIC_MAP_DIR, '*.png')))
-    window = NavigatorApp(session, maps)
+    window = NavigatorApp(session, maps, theme=args.theme)
     if args.map:
         window._map_paths.insert(0, args.map)
         window.map_combo.insertItem(0, os.path.basename(args.map))
+        set_item_tooltips(window.map_combo, window._map_paths)
         window.map_combo.setCurrentIndex(0)
     if window._map_paths:
         window.load_selected_map()
