@@ -323,6 +323,7 @@ class CrowdSim_train(TransitionMixin, gym.Env):
 
 class CrowdSim_test(TransitionMixin, gym.Env):
     metadata = {'render.modes': ['human']}
+    start_on_route = False  # env.config [env]: the ship starts heading along its route
 
     def __init__(self):
         """
@@ -364,6 +365,7 @@ class CrowdSim_test(TransitionMixin, gym.Env):
         self.time_limit = config.getint('env', 'time_limit')
         self.time_step = config.getfloat('env', 'time_step')
         self.randomize_attributes = config.getboolean('env', 'randomize_attributes')
+        self.start_on_route = config.getboolean('env', 'start_on_route', fallback=False)
         self.success_reward = config.getfloat('reward', 'success_reward')
         self.collision_penalty = config.getfloat('reward', 'collision_penalty')
         self.discomfort_dist = config.getfloat('reward', 'discomfort_dist')
@@ -724,6 +726,14 @@ class CrowdSim_test(TransitionMixin, gym.Env):
         self.global_path = global_path[::-1]
         self.local_goals = self.global_path
 
+    def start_heading(self):
+        """Heading the ship starts with: along the first route segment when
+        start_on_route is set, else north as before."""
+        if self.start_on_route and len(self.global_path) > 1:
+            (x0, y0), (x1, y1) = self.global_path[:2]
+            return math.atan2(y1 - y0, x1 - x0)
+        return np.pi / 2
+
     def set_one_local_goal(self, one_goal):
         self.current_goal = one_goal
 
@@ -759,7 +769,8 @@ class CrowdSim_test(TransitionMixin, gym.Env):
             self.case_counter[phase] = test_case
 
         self.global_time = 0
-        self.robot.set(self.robot_start[0], self.robot_start[1], self.robot_end[0], self.robot_end[1], 0, 0, np.pi / 2)
+        self.robot.set(self.robot_start[0], self.robot_start[1], self.robot_end[0], self.robot_end[1], 0, 0,
+                       self.start_heading())
 
         # generate dynamic obstacles
         self.generate_dynamic_humans(dym_obs_list or [])

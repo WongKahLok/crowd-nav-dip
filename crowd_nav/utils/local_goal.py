@@ -29,11 +29,19 @@ class LocalGoalTracker:
       is visible the previous goal is kept as long as it is still ahead. The
       destination itself only has to fit the ship, so a route that ends near
       the coast can still be completed.
+    * A ship that has stood still for ``stall_time`` seconds on the goal it kept
+      would stay there, since nothing ahead passes the corridor check and
+      stopping on a goal scores well. Only then the corridor narrows to the land
+      margin of the safety filter (see ``SARL.coast_margin``), and as a last
+      resort to the ship itself. ``stall_time = 0`` turns this off.
     """
+
+    COAST_SLACK = 0.01  # m the narrowed corridor may close the ship's own land gap by
 
     def __init__(self, path, time_step, goal_dist=1.0, monitor_dist=5.0, monitor_exit=None,
                  lookahead_rate=1.0, shore_clearance=0.5, min_goal_dist=0.5, land_rects=(),
-                 map_bounds=None, window=None, visibility_checks=10):
+                 map_bounds=None, window=None, visibility_checks=10, stall_time=10.0,
+                 stop_speed=0.05, safety_margin_static=0.2):
         self.path = [tuple(map(float, p)) for p in path]
         if not self.path:
             raise ValueError('The route needs at least one point')
@@ -54,6 +62,9 @@ class LocalGoalTracker:
         self.map_bounds = map_bounds
         self.window = 2 * monitor_dist if window is None else window
         self.visibility_checks = visibility_checks
+        self.stall_time = stall_time
+        self.stop_speed = stop_speed
+        self.safety_margin_static = safety_margin_static
         steps = [math.dist(a, b) for a, b in zip(self.path, self.path[1:])]
         self.arc = np.concatenate([[0.0], np.cumsum(steps)])
         # state carried from step to step
@@ -63,16 +74,26 @@ class LocalGoalTracker:
         self.goal_index = None
         self.goal = self.path[0]
         self.nearest_obstacle = math.inf
+        self.stopped_time = 0.0
 
     @classmethod
     def from_env(cls, env, path, **kwargs):
-        """Build a tracker that uses the land geometry of a map environment."""
+        """Build a tracker that uses the land geometry of a map environment.
+
+        The stall settings come from the policy sailing the ship, when it has them.
+        """
+        policy = getattr(getattr(env, 'robot', None), 'policy', None)
+        for name in ('stall_time', 'stop_speed', 'safety_margin_static'):
+            if hasattr(policy, name):
+                kwargs.setdefault(name, getattr(policy, name))
         return cls(path, env.time_step, land_rects=getattr(env, 'land_rects', ()),
                    map_bounds=getattr(env, 'map_bounds', None), **kwargs)
 
     def update(self, ship_state, obstacle_states):
         """Advance the tracker one step and return the local goal as (x, y)."""
         position = (ship_state.px, ship_state.py)
+        stopped = math.hypot(ship_state.vx, ship_state.vy) < self.stop_speed
+        self.stopped_time = self.stopped_time + self.time_step if stopped else 0.0
         self._advance_progress(position, ship_state.radius)
         self._update_lookahead(position, obstacle_states)
         self.goal = self._select_goal(position, ship_state.radius)
@@ -122,14 +143,28 @@ class LocalGoalTracker:
             if math.dist(position, self.path[i]) >= self.lookahead:
                 ahead = i
                 break
-        corridor = radius + self.shore_clearance
-        for i in range(ahead, self.progress - 1, -1):
-            if i != last and math.dist(position, self.path[i]) < self.min_goal_dist:
-                break
-            if self._clear(position, self.path[i], radius if i == last else corridor):
-                self.goal_index = i
-                return self.path[i]
+        for clearance in self._clearances(position, radius):
+            for i in range(ahead, self.progress - 1, -1):
+                if i != last and math.dist(position, self.path[i]) < self.min_goal_dist:
+                    break
+                if self._clear(position, self.path[i], radius if i == last else radius + clearance):
+                    self.goal_index = i
+                    return self.path[i]
         if self.goal_index is not None and self.goal_index >= self.progress:
             return self.path[self.goal_index]
         self.goal_index = ahead
         return self.path[ahead]
+
+    def _parked(self, position):
+        """True when the ship has stood still for ``stall_time`` on the goal it kept."""
+        return (0 < self.stall_time <= self.stopped_time
+                and self.goal_index is not None and self.goal_index >= self.progress
+                and math.dist(position, self.path[self.goal_index]) < self.min_goal_dist)
+
+    def _clearances(self, position, radius):
+        """Room to keep from land on the way to a goal, strictest first."""
+        if not self._parked(position):
+            return [self.shore_clearance]
+        gap = static_clearance(position, position, radius, self.land_rects, self.map_bounds)
+        margin = min(self.shore_clearance, self.safety_margin_static, gap - self.COAST_SLACK)
+        return [self.shore_clearance, max(0.0, margin), 0.0]

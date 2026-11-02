@@ -99,7 +99,19 @@ class SARL(MultiHumanRL):
         self.max_turn_rate = math.radians(60)
         self.heading_samples = 7
         self.stop_speed = 0.05
-        # value penalty per radian of heading change, see predict()
+        # false: a stopped ship keeps its last course and sets off within the turn window
+        self.turn_at_rest = False
+        # last direction of motion this episode, see course()
+        self.last_course = None
+        self._course_time = -1.0
+        # true while select_action retries a stopped ship with every set-off direction
+        self._set_off_free = False
+        # a ship stopped this long is pushed for push_time seconds, see unstick(); 0 turns it off
+        self.stall_time = 10.0
+        self.push_time = 2.0
+        self._stopped_time = 0.0
+        self._push_left = 0.0
+        # value penalty per radian of heading change, see plan()
         self.continuity_weight = 0.01
         # safety filter
         self.safety_margin_static = 0.2
@@ -138,6 +150,9 @@ class SARL(MultiHumanRL):
             'motion', 'max_turn_rate', fallback=math.degrees(self.max_turn_rate)))
         self.heading_samples = config.getint('motion', 'heading_samples', fallback=self.heading_samples)
         self.stop_speed = config.getfloat('motion', 'stop_speed', fallback=self.stop_speed)
+        self.turn_at_rest = config.getboolean('motion', 'turn_at_rest', fallback=self.turn_at_rest)
+        self.stall_time = config.getfloat('motion', 'stall_time', fallback=self.stall_time)
+        self.push_time = config.getfloat('motion', 'push_time', fallback=self.push_time)
         self.continuity_weight = config.getfloat('motion', 'continuity_weight',
                                                  fallback=self.continuity_weight)
         self.safety_margin_static = config.getfloat('safety', 'safety_margin_static',
@@ -174,7 +189,7 @@ class SARL(MultiHumanRL):
         direction of motion within the turn rate limit, so every candidate can
         be executed as chosen. The current speed and heading are always among
         the samples, and the stop action is added whenever it is reachable. A
-        ship that is (nearly) at rest may set off in any direction. A preset
+        ship that has stopped turns from its last course (see ``course``). A preset
         ``action_space`` is used unchanged, which is also the fallback when the
         limits are switched off.
         """
@@ -197,10 +212,11 @@ class SARL(MultiHumanRL):
 
         actions = []
         if self.kinematics == 'holonomic':
-            if speed < self.stop_speed:
+            course = self.course(nav, speed)
+            if course is None:
                 headings = np.linspace(0, 2 * np.pi, self.rotation_samples, endpoint=False)
             else:
-                headings = math.atan2(nav.vy, nav.vx) + np.array(offsets)
+                headings = course + np.array(offsets)
             for heading in headings:
                 for s in speeds:
                     actions.append(ActionXY(s * math.cos(heading), s * math.sin(heading)))
@@ -213,6 +229,20 @@ class SARL(MultiHumanRL):
         if low <= 1e-9:
             actions.append(self.stop_action())
         return actions
+
+    def course(self, nav, speed):
+        now = getattr(self.env, 'global_time', None)
+        if now is None or now <= 0 or now < self._course_time:
+            self.last_course = None  # a new episode
+        self._course_time = -1.0 if now is None else now
+        if self.last_course is None and getattr(self.env, 'start_on_route', False):
+            self.last_course = nav.theta  # the heading the scenario gave the ship at the start
+        if speed > 1e-9:
+            self.last_course = math.atan2(nav.vy, nav.vx)
+        if speed < self.stop_speed and (self.turn_at_rest or self.last_course is None
+                                        or self._set_off_free):
+            return None
+        return self.last_course
 
     # -- safety filter --------------------------------------------------------
 
@@ -339,6 +369,10 @@ class SARL(MultiHumanRL):
     # -- prediction -----------------------------------------------------------
 
     def predict(self, state):
+        """Choose with ``plan``; ``unstick`` then moves a ship that would stay stopped."""
+        return self.unstick(state, self.plan(state))
+
+    def plan(self, state):
         """
         Score only the candidates that pass the swept safety check with the value
         network, charge ``continuity_weight`` per radian of heading change so
@@ -363,7 +397,27 @@ class SARL(MultiHumanRL):
             self.step_static_margin = None
 
     def select_action(self, state):
-        """The body of ``predict``, run with the step's land margin in force."""
+        """The body of ``predict``, run with the step's land margin in force.
+
+        A stopped ship can only set off within the turn window of its last course. When
+        that window holds nothing better than staying stopped (the course points at the
+        shore or away from the goal), the ship would never move again, so it chooses once
+        more among every set-off direction. A ship that still prefers to wait keeps waiting.
+        """
+        action = self.choose_action(state)
+        nav = state.self_state
+        if (self.constrained and self.kinematics == 'holonomic' and self.action_space is None
+                and not self.turn_at_rest and math.hypot(nav.vx, nav.vy) < self.stop_speed
+                and math.hypot(action.vx, action.vy) < 1e-9):
+            self._set_off_free = True
+            try:
+                action = self.choose_action(state)
+            finally:
+                self._set_off_free = False
+        return action
+
+    def choose_action(self, state):
+        """One selection among the candidate actions, see ``select_action``."""
         nav = state.self_state
         humans, next_humans = self.env.predict_humans(state, self.query_env)
         actions = self.candidate_actions(nav)
@@ -397,3 +451,47 @@ class SARL(MultiHumanRL):
         if self.phase == 'train':
             self.last_state = self.transform(state)
         return action
+
+    # -- stalls ---------------------------------------------------------------
+
+    PUSH_LOOK = 3.0  # m ahead a pushed ship looks for open water
+
+    def unstick(self, state, action):
+        """Push a ship that has stood still for ``stall_time`` seconds and wants to stay.
+
+        Far from the goal, stopping and the best move can score almost the same, and then
+        the ship can wait out the whole trip. A ship parked on its local goal is freed by the
+        goal tracker instead. Not used in training.
+        """
+        nav = state.self_state
+        now = getattr(self.env, 'global_time', None)
+        if now is None or now <= 0:  # a new episode
+            self._stopped_time = self._push_left = 0.0
+        if self.phase == 'train' or self.stall_time <= 0 or self.kinematics != 'holonomic':
+            return action
+        if self._push_left > 0:
+            self._push_left -= self.time_step
+            return self.push_action(nav) or action
+        stopped = math.hypot(nav.vx, nav.vy) < self.stop_speed
+        self._stopped_time = self._stopped_time + self.time_step if stopped else 0.0
+        if self._stopped_time >= self.stall_time and math.hypot(action.vx, action.vy) < self.stop_speed:
+            self._stopped_time, self._push_left = 0.0, self.push_time
+        return action
+
+    def push_action(self, nav):
+        """The safe action at top speed with the most open water ahead, then the best score."""
+        moving = [(math.hypot(a.vx, a.vy), value, a) for value, a, safe
+                  in zip(self.action_values, self.candidates, self.safe_mask)
+                  if safe and math.hypot(a.vx, a.vy) > 1e-9]
+        if not moving:
+            return None
+        top = max(speed for speed, _, _ in moving)
+        rects = getattr(self.env, 'land_rects', ())
+        bounds = getattr(self.env, 'map_bounds', None)
+
+        def water(item):
+            speed, value, a = item
+            ahead = (nav.px + self.PUSH_LOOK * a.vx / speed, nav.py + self.PUSH_LOOK * a.vy / speed)
+            return round(static_clearance((nav.px, nav.py), ahead, nav.radius, rects, bounds), 3), value
+
+        return max((m for m in moving if m[0] >= top - 1e-6), key=water)[2]

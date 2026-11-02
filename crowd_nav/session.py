@@ -92,7 +92,8 @@ class ScenarioSession(object):
 
     def __init__(self, model_dir, policy_name='sarl', safety_distance=1, colregs=False,
                  local_goal_dist=1.0, monitor_dist=5.0, monitor_exit_dist=None,
-                 lookahead_rate=1.0, shore_clearance=0.5, device=None, policy=None):
+                 lookahead_rate=1.0, shore_clearance=0.5, device=None, policy=None,
+                 robot_visible=True):
         self.model_dir = model_dir
         self.policy_name = policy_name
         self.safety_distance = safety_distance
@@ -102,12 +103,18 @@ class ScenarioSession(object):
         self.monitor_exit_dist = monitor_exit_dist
         self.lookahead_rate = lookahead_rate
         self.shore_clearance = shore_clearance
+        self.robot_visible = robot_visible
 
         env_config_path = os.path.join(model_dir, 'env.config')
         if not os.path.exists(env_config_path):
             raise ScenarioError('Model config not found: {}'.format(env_config_path))
         self.env_config = configparser.RawConfigParser()
         self.env_config.read(env_config_path)
+        if robot_visible:
+            # exp.py runs every experiment with robot.visible=true, so the other ships see
+            # ours and steer around it. Do the same here, so a run in the window matches
+            # the results table. robot_visible=False keeps the model folder's own value.
+            self.env_config.set('robot', 'visible', 'true')
 
         if policy is None:
             problem = model_dir_problem(model_dir)

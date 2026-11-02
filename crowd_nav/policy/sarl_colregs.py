@@ -123,7 +123,7 @@ class SARLColregs(SARL):
         """The encounters whose rules are enforced this step, most urgent first.
 
         Urgency is time to closest approach, then range. In a channel the duties of
-        several ships can conflict, so ``predict`` drops them from the end of this list
+        several ships can conflict, so ``plan`` drops them from the end of this list
         until something safe keeps the rest. Stand-on duties are included only with
         ``enforce_stand_on``; every encounter is still measured.
         """
@@ -181,7 +181,7 @@ class SARLColregs(SARL):
             return candidate._replace(safe=False)
         return candidate
 
-    def predict(self, state):
+    def plan(self, state):
         self.encounters = self.update_encounters(state)
         duties = self.enforced_duties()
         try:
@@ -211,4 +211,4 @@ class SARLColregs(SARL):
         self._apply_rules = not final
         self._rule_free_safe = 0
         self.rule_filtered = 0
-        return super().predict(state)
+        return super().plan(state)

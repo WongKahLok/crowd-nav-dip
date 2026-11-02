@@ -43,7 +43,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_ROOT = os.path.join(REPO_ROOT, 'crowd_nav', 'data')
 # the policies the window offers: policy_factory name, label
 POLICIES = [('sarl', 'SARL'), ('sarl_colregs', 'SARL + COLREGs')]
-DEFAULT_MODEL_DIR = os.path.join(MODEL_ROOT, 'output-trained')
+DEFAULT_MODEL_DIR = os.path.join(MODEL_ROOT, 'output-sarl')
 STATIC_MAP_DIR = os.path.join(REPO_ROOT, 'static_maps')
 
 MAP_SIZE = 50.0
@@ -938,6 +938,7 @@ class NavigatorApp(QMainWindow):
                                local_goal_dist=s.local_goal_dist, monitor_dist=s.monitor_dist,
                                monitor_exit_dist=s.monitor_exit_dist,
                                lookahead_rate=s.lookahead_rate, shore_clearance=s.shore_clearance,
+                               robot_visible=s.robot_visible,
                                device=None if s.device is None else str(s.device))
 
     @staticmethod
