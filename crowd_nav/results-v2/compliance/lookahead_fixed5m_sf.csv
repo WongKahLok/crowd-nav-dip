@@ -1,6 +1,6 @@
 map,seed,ships,outcome,steps,encounters,compliant_encounters,compliance_rate,violating_steps,encounter_steps,stopped_steps,head_on_encounters,crossing_encounters,overtaking_encounters,overtaken_encounters,head_on_compliant,crossing_compliant,overtaking_compliant,overtaken_compliant,give_way_encounters,stand_on_encounters,give_way_compliant,stand_on_compliant
 land_shapes_sf_crop,0,8,success,103,1,0,0.0,23,47,0,0,1,0,0,0,0,0,0,1,0,0,0
-land_shapes_sf_crop,1,8,success,191,5,2,0.4,19,216,1,1,2,1,1,0,2,0,0,2,3,0,2
+land_shapes_sf_crop,1,8,success,190,5,2,0.4,19,216,1,1,2,1,1,0,2,0,0,2,3,0,2
 land_shapes_sf_crop,2,8,success,172,4,0,0.0,32,110,0,0,4,0,0,0,0,0,0,3,1,0,0
 land_shapes_sf_crop,3,8,success,199,2,1,0.5,14,50,0,2,0,0,0,1,0,0,0,2,0,1,0
 land_shapes_sf_crop,4,8,success,100,1,0,0.0,4,21,0,0,1,0,0,0,0,0,0,0,1,0,0
@@ -83,7 +83,7 @@ land_shapes_sf_crop,80,8,success,97,5,0,0.0,41,98,0,1,4,0,0,0,0,0,0,4,1,0,0
 land_shapes_sf_crop,81,8,success,181,2,1,0.5,3,39,0,0,2,0,0,0,1,0,0,1,1,0,1
 land_shapes_sf_crop,82,8,success,113,2,0,0.0,10,62,0,0,2,0,0,0,0,0,0,1,1,0,0
 land_shapes_sf_crop,83,8,success,121,4,0,0.0,24,120,0,1,1,0,2,0,0,0,0,1,3,0,0
-land_shapes_sf_crop,84,8,success,194,6,1,0.1667,33,201,2,0,5,0,1,0,1,0,0,1,5,0,1
+land_shapes_sf_crop,84,8,success,195,6,1,0.1667,40,177,2,1,4,0,1,0,1,0,0,1,5,0,1
 land_shapes_sf_crop,85,8,success,104,1,1,1.0,0,19,0,0,1,0,0,0,1,0,0,0,1,0,1
 land_shapes_sf_crop,86,8,success,193,3,0,0.0,85,203,0,1,2,0,0,0,0,0,0,3,0,0,0
 land_shapes_sf_crop,87,8,success,163,4,2,0.5,2,113,0,0,4,0,0,0,2,0,0,0,4,0,2
