@@ -1,22 +1,26 @@
 # CrowdNav
 
+To run the project once it is set up, follow [WORKFLOW.md](WORKFLOW.md).
+
 ## Setup
 1. Install necessary library for the system
 ```
 sudo apt update && sudo apt install cmake build-essential ffmpeg
 ```
 
-2. Create Anconda environment
+2. Create the Anaconda environment
 ```terminal
 conda create -n crowdnav python=3.10
+conda activate crowdnav
 ```
 
-3. Install crowd_sim and crowd_nav into pip
+3. Install the Python packages
 ```
 pip install -r requirements.txt
 ```
 
-4. Install [Python-RVO2](https://github.com/sybrenstuvel/Python-RVO2) library 
+4. Install the [Python-RVO2](https://github.com/sybrenstuvel/Python-RVO2) library, then
+crowd_sim and crowd_nav
 ```
 unzip Python-RVO2-main.zip
 cd Python-RVO2-main
@@ -26,39 +30,33 @@ pip install -e .
 ```
 
 ## Getting Started
-1. Train a policy.
+Training, experiments and videos are in [WORKFLOW.md](WORKFLOW.md). The commands below
+film one fixed test case with the ships listed in `DYNAMIC_OBSTACLES` in `test.py`. Unlike
+everything else, they run from the `crowd_nav` folder.
 ```
-python train.py --policy sarl --gpu
-```
-2. Visualize a test case.
-```
+cd crowd_nav
 python test.py \
                --policy sarl \
-               --model_dir data/output-trained \
+               --model_dir data/output-sarl \
                --phase test \
                --visualize \
                --test_case 0 \
-               --video_file data/output-trained/test_case_0.mp4 \
+               --video_file data/output-sarl/test_case_0.mp4 \
                --static_map ../static_maps/land_shapes_sf_crop.png
 ```
-```
-python test.py \
-               --policy sarl \
-               --model_dir data/output-trained \
-               --phase test \
-               --visualize \
-               --test_case 0 \
-               --video_file data/output-trained/test_case_1.mp4 \
-               --static_map ../static_maps/land_shapes_ht_crop.png
-```
+Change `sf` to `ht` for the other map. It does not work on `sg`: the start and goal in
+`test.py` have no route there.
+
 ## Scenario GUI
 
 `crowd_nav/gui.py` is a PyQt5 window for building a scenario by hand instead of editing
 `DYNAMIC_OBSTACLES` in `test.py`. Run it from the repository root:
 
 ```
-python -m crowd_nav.gui [--model_dir DIR] [--map PNG] [--gpu] [--colregs] [--safety_distance 1]
+python -m crowd_nav.gui [--model_dir DIR] [--map PNG] [--gpu] [--colregs] [--safety_distance 1] [--theme THEME]
 ```
+
+It uses `crowd_nav/data/output-sarl` unless `--model_dir` says otherwise.
 
 The left half is one matplotlib axes that is both the map and the playback screen; the
 right half is the control panel; the log is at the bottom.
@@ -118,13 +116,16 @@ closer than that; monitoring ends only beyond `--monitor_exit_dist` (default
 if the straight segment from the ship keeps `--shore_clearance` (plus the
 radius) from land and the map edge; otherwise the goal walks back towards the
 ship, and if nothing is visible the previous goal is kept. The destination
-itself only has to fit the ship.
+itself only has to fit the ship. A ship that has stood still for `stall_time`
+seconds on the goal it kept gets a narrower corridor, so the goal can move on.
 
 `SARL.predict` builds its candidate actions from the current velocity using the
 `[motion]` section of `policy.config`: speeds within `max_accel` / `max_decel`
 per step, headings within `max_turn_rate` per step (`heading_samples` around
-the current heading, the current velocity always included, all directions when
-at rest below `stop_speed`). Every candidate is swept over the next step with
+the current heading, the current velocity always included). A ship at rest below
+`stop_speed` keeps its last course and sets off within the turn window; it gets
+all directions only before it has moved, with `turn_at_rest`, or when it would
+otherwise stay stopped. Every candidate is swept over the next step with
 the shared collision geometry and must keep `safety_margin_static` from land
 and `safety_margin_dynamic` from the predicted ships; with `braking_check` it
 must also be able to stop at `max_decel` afterwards without violating those
@@ -134,7 +135,9 @@ candidates are scored by the value network, and the score is
 reduced by `continuity_weight` per radian of heading change so close scores
 keep the current course; a ship at rest and the stop action pay no penalty.
 Reaching a local goal does not force a stop: the stop action is a candidate
-like any other and must pass the same check. When no candidate is safe the
+like any other and must pass the same check. A ship that has been stopped for
+`stall_time` seconds and still wants to stay is pushed for `push_time` seconds
+at the top safe speed, towards the most open water. When no candidate is safe the
 policy returns a constrained deceleration: among the non-accelerating
 candidates (or all of them when at rest) the one with the largest swept
 clearance, so stopping into an oncoming ship is not chosen. The action is
@@ -150,7 +153,7 @@ Run from the repository root after installing the project dependencies:
 MPLBACKEND=Agg python -m pytest tests -q
 
 MPLBACKEND=Agg python -m crowd_nav.evaluate \
-  --policy sarl --model_dir crowd_nav/data/output-trained \
+  --policy sarl --model_dir crowd_nav/data/output-sarl \
   --static_map static_maps/land_shapes_sf_crop.png static_maps/land_shapes_ht_crop.png \
   --episodes 1 --densities 0,4 --seed 0 --max_steps 500 --out sarl_results.csv
 ```

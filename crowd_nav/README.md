@@ -1,37 +1,29 @@
 # Evaluation and COLREGs
 
-How to run every experiment in the project, and what each file is for.
-
-Everything runs through one script, `exp.sh`
-
-## Quick start
-
-```bash
-./crowd_nav/exp.sh list                                      # what experiments exist
-./crowd_nav/exp.sh run visible_colregs                       # run one (writes CSVs) (refer to experiment.txt to choose which you want to run)
-./crowd_nav/exp.sh compare visible_sarl_dense visible_colregs_dense      # compare two model, success rates + p-values
-./crowd_nav/exp.sh rules visible_colregs                     # COLREGs compliance
-./crowd_nav/exp.sh video visible_colregs ht:8:60             # output mp4 of map:ships:trip
-```
-
+What each file is for. How to run things is in [WORKFLOW.md](../WORKFLOW.md); everything
+runs through `python -m crowd_nav.exp`, and the experiments are the rows of `experiments.txt`.
 
 ## Model folders
 
-| folder | difference with data/output-trained | used by |
+| folder | what it is | used by |
 | --- | --- | --- |
-| `output-visible` | `visible = true` in `env.config` | the COLREGs experiments |
+| `data/output-sarl` | the retrained SARL | the main experiments and the GUI |
+| `data/output-reward_design` | trained with `discomfort_dist = 0.4` | `sarl_reward_dsgn` |
+| `data/output-domain_rdm` | trained with random ship sizes and speeds | the `sarl_domain_rdm` rows |
+| `data/output-trained` | the first model | the tests |
 
-They are derived, so they are git-ignored. Delete them freely; they rebuild in seconds.
+The settings each training started from are in `configs/sarl`, `configs/reward_design` and
+`configs/domain_rdm`.
 
 ## Where results go
 
 ```
 results-v2/
-  NAME_sf.csv, NAME_ht.csv     one row per trip: outcome, time, distance, clearances
+  NAME_sf.csv, _ht, _sg        one row per trip: outcome, time, distance, clearances
+  NAME.json                    settings, commit and weights of that run
   compliance/NAME_sf.csv, ...  one row per trip: encounters, which rule, obeyed or not
+  colregs_report.md            the table
   videos/NAME/*.mp4
-  parts/                       per-shard run logs (git-ignored); the receipts for a run
-  extra/                       measured but not reported
 ```
 
 ## COLREGs
@@ -40,14 +32,14 @@ results-v2/
 | --- | --- |
 | `policy/colregs.py` | the rules: who gives way, who stands on, when a meeting ends |
 | `policy/sarl_colregs.py` | `SARLColregs` - drops rule-breaking actions before SARL ranks what is left. No retraining |
-| `policy/test_colregs.py` | 23 unit tests for the classifier. No simulator, no torch |
+| `policy/test_colregs.py` | 27 unit tests for the classifier. No simulator, no torch |
 
 Run the tests any time:
 
 ```bash
-PYTHONPATH=. python -m crowd_nav.policy.test_colregs
+python -m crowd_nav.policy.test_colregs
 ```
 
 The policy is registered as `sarl_colregs`, so it works anywhere a policy name is taken,
-including `test.py`. Note `test.py` runs a single trip with a hardcoded 6 ships and
-writes no metrics; all reported numbers come from `evaluate.py` via `exp.sh run`.
+including `test.py`. Note `test.py` runs a single trip with a hardcoded list of ships and
+writes no metrics; all reported numbers come from `evaluate.py` via `crowd_nav.exp run`.
