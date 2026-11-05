@@ -1,0 +1,5 @@
+# A* and Theta* comparison
+
+In the scenario editor, load a map and choose start and goal. Select A* or Theta* under Global route planner, then click Plan route to display and simulate that route. Changing the dropdown alone does not replace the current route; Plan route clears generated ships and previous results as before.
+
+Compare A* and Theta* runs both existing implementations on the same inflated grid without replacing the active scenario. It shows path length in metres, direction changes, expanded nodes and median planning time over five fresh runs. Choose Yes to export the table as UTF-8 CSV. Record multiple start/goal pairs on each map for the report; a single comparison is not a general performance conclusion. Timing depends on the computer and includes planner construction. These metrics measure global planning, not SARL performance or dynamic collision avoidance. The implementations are AStar and ThetaStar in crowd_nav/utils/theta_star.py; both use Euclidean heuristics and the same eight-neighbour grid, while Theta* additionally permits line-of-sight shortcuts.
