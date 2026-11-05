@@ -189,7 +189,7 @@ def test_export_results_csv_is_one_row_in_the_batch_columns(session, tmp_path):
     session.generate_obstacles(2, 7)
     result = session.run_episode(max_steps=4)
     path = session.export_results(result, tmp_path / 'run.csv')
-    with open(path, newline='') as fh:
+    with open(path, newline='', encoding='utf-8') as fh:
         rows = list(csv.DictReader(fh))
     assert len(rows) == 1
     row = rows[0]
