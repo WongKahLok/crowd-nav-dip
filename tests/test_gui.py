@@ -399,3 +399,15 @@ def test_system_theme_is_followed_while_the_window_is_open(qapp, monkeypatch):
         assert not fixed._theme_timer.isActive(), 'a chosen theme is not overridden'
     finally:
         fixed.close()
+
+def test_planner_choice_and_comparison(app, monkeypatch):
+    from PyQt5.QtWidgets import QMessageBox
+    app.session.set_start((5, 5))
+    app.session.set_goal((40, 40))
+    app.planner_combo.setCurrentText('A*')
+    app.plan_route()
+    assert app.session.scenario['planner'] == 'A*'
+    original = app.session.scenario
+    monkeypatch.setattr(QMessageBox, 'question', lambda *args: QMessageBox.No)
+    app.compare_planners()
+    assert app.session.scenario is original

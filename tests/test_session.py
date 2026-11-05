@@ -387,3 +387,13 @@ def test_set_policy_loads_sarl_colregs_from_the_model_folder(tmp_path):
     assert isinstance(session.policy, SARLColregs) and session.policy.env is session.env
     result = session.run_episode(max_steps=3)
     assert result.context['policy'] == 'SARL-COLREGs'
+
+def test_compare_planners_preserves_active_scenario(session, tmp_path):
+    plan(session, tmp_path)
+    original = session.scenario
+    rows = session.compare_planners(repeats=2)
+    assert session.scenario is original
+    assert [r['planner'] for r in rows] == ['A*', 'Theta*']
+    assert all(r['found'] and r['median_ms'] >= 0 for r in rows)
+    assert rows[1]['length_m'] <= rows[0]['length_m'] + 1e-9
+    assert session.plan_route('A*')['planner'] == 'A*'

@@ -579,6 +579,14 @@ class NavigatorApp(QMainWindow):
         self.goal_label = QLabel('Goal: not set')
         layout.addWidget(self.start_label)
         layout.addWidget(self.goal_label)
+        self.planner_combo = QComboBox()
+        self.planner_combo.addItems(['Theta*', 'A*'])
+        self.planner_combo.setToolTip('Planner used the next time you click Plan route')
+        layout.addWidget(QLabel('Global route planner'))
+        layout.addWidget(self.planner_combo)
+        self.compare_button = QPushButton('Compare A* and Theta*')
+        self.compare_button.clicked.connect(self.compare_planners)
+        layout.addWidget(self.compare_button)
         self.plan_button = QPushButton('Plan route')
         self.plan_button.clicked.connect(self.plan_route)
         layout.addWidget(self.plan_button)
@@ -809,6 +817,8 @@ class NavigatorApp(QMainWindow):
         self.map_combo.setEnabled(not running)
         self.start_radio.setEnabled(not running and state != 'no_map')
         self.goal_radio.setEnabled(not running and state != 'no_map')
+        self.planner_combo.setEnabled(not running)
+        self.compare_button.setEnabled(not running and both_points)
         self.plan_button.setEnabled(not running and both_points)
         self.generate_button.setEnabled(not running and has_route)
         if not has_route and self.ship_radio.isChecked():
@@ -1130,12 +1140,41 @@ class NavigatorApp(QMainWindow):
 
     def plan_route(self):
         try:
-            scenario = self.session.plan_route()
+            scenario = self.session.plan_route(self.planner_combo.currentText())
         except ScenarioError as error:
             self._fail(error)
             return
         self._refresh_after_change()
-        self._set_status('Route planned, cost {:.2f}'.format(scenario['cost']))
+        self._set_status('{} route planned, cost {:.2f}'.format(scenario['planner'], scenario['cost']))
+
+    def compare_planners(self):
+        import csv
+        try:
+            rows = self.session.compare_planners()
+        except ScenarioError as error:
+            self._fail(error)
+            return
+        lines = ['Same map, start, goal and safety belt. Median of 5 runs.',
+                 'Global planning only; does not measure SARL or moving-ship avoidance.']
+        for row in rows:
+            lines.append('{}: {}'.format(row['planner'],
+                '{:.2f} m, {} turns, {} expanded nodes, {:.3f} ms'.format(
+                    row['length_m'], row['turns'], row['expanded_nodes'], row['median_ms'])
+                if row['found'] else 'No route'))
+        answer = QMessageBox.question(self, 'A* / Theta* comparison',
+            '\n\n'.join(lines) + '\n\nSave these results as CSV?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            path, _ = QFileDialog.getSaveFileName(self, 'Save planner comparison',
+                                                  'planner-comparison.csv', 'CSV (*.csv)')
+            if path:
+                try:
+                    with open(path, 'w', newline='', encoding='utf-8') as fh:
+                        writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+                        writer.writeheader()
+                        writer.writerows(rows)
+                except OSError as error:
+                    self._fail(ScenarioError(str(error)))
 
     # ------------------------------------------------------------- obstacles
 

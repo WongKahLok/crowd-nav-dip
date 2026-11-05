@@ -17,12 +17,14 @@ therefore pairs with ``imshow(..., origin='lower', extent=(0, 50, 0, 50))``.
 import configparser
 import math
 import os
+import time
+import statistics
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import numpy as np
 
-from crowd_nav.utils.theta_star import ThetaStar
+from crowd_nav.utils.theta_star import AStar, ThetaStar
 
 GRID_X, GRID_Y, GRID_RES = 50, 50, 1
 MAP_X_MIN, MAP_Y_MIN = 0.0, 0.0
@@ -260,7 +262,7 @@ class ScenarioSession(object):
 
     # ------------------------------------------------------------------ route
 
-    def plan_route(self):
+    def plan_route(self, algorithm="Theta*"):
         """Theta* on the inflated grid; stores the goal-first path and a start-first route."""
         if self.plan_grid is None:
             raise ScenarioError('Load a map first')
@@ -268,18 +270,51 @@ class ScenarioSession(object):
             raise ScenarioError('Set a start and a goal first')
         if self.start_cell == self.goal_cell:
             raise ScenarioError('Start and goal are in the same cell')
-        cost, path, _ = ThetaStar(start=self.start_cell, goal=self.goal_cell,
-                                  env=self.plan_grid).plan()
+        if algorithm not in ('A*', 'Theta*'):
+            raise ScenarioError('Unknown planner: {}'.format(algorithm))
+        planner = {'A*': AStar, 'Theta*': ThetaStar}[algorithm]
+        started = time.perf_counter()
+        cost, path, expanded = planner(start=self.start_cell, goal=self.goal_cell,
+                                      env=self.plan_grid).plan()
+        elapsed = (time.perf_counter() - started) * 1000
         if not path:
             raise ScenarioError('No route between the start and the goal')
         self.scenario = {'start': self.start_cell, 'goal': self.goal_cell,
-                         'cost': cost, 'path': path, 'dyn': []}
+                         'cost': cost, 'path': path, 'dyn': [], 'planner': algorithm,
+                         'planning_ms': elapsed, 'expanded_nodes': len(expanded)}
         # set_local_goal_list wants the goal first; the obstacle generator wants the ship's
         # own route start first, so keep that one around separately.
         self.route = self.sim_grid.grid_2_drl(path)[::-1]
         self.result = None
         self.warnings = []
         return self.scenario
+
+    def compare_planners(self, repeats=5):
+        """Compare global routes without replacing the active scenario or obstacles."""
+        if self.plan_grid is None or self.start_cell is None or self.goal_cell is None:
+            raise ScenarioError('Load a map and set start and goal first')
+        if self.start_cell == self.goal_cell:
+            raise ScenarioError('Start and goal are in the same cell')
+        if repeats < 1:
+            raise ScenarioError('At least one timing repeat is required')
+        rows = []
+        for name, planner in [('A*', AStar), ('Theta*', ThetaStar)]:
+            times = []
+            for _ in range(repeats):
+                started = time.perf_counter()
+                cost, path, expanded = planner(self.start_cell, self.goal_cell, self.plan_grid).plan()
+                times.append((time.perf_counter() - started) * 1000)
+            turns = 0
+            for a, b, c in zip(path, path[1:], path[2:]):
+                u, v = (b[0]-a[0], b[1]-a[1]), (c[0]-b[0], c[1]-b[1])
+                turns += abs(u[0]*v[1]-u[1]*v[0]) > 1e-9
+            rows.append(dict(planner=name, found=bool(path),
+                             length_m=cost * self.plan_grid.resolution if path else '',
+                             turns=turns, expanded_nodes=len(expanded),
+                             median_ms=statistics.median(times), repeats=repeats,
+                             map=self.map_path, start=str(self.start_cell), goal=str(self.goal_cell),
+                             safety_distance=self.safety_distance))
+        return rows
 
     # -------------------------------------------------------------- obstacles
 
@@ -486,7 +521,7 @@ class ScenarioSession(object):
                 row.update(map=context.get('map', ''), seed=context.get('seed', ''),
                            requested_n_dynamic=context.get('requested_ships', ''))
                 row.update({key: context.get(key, '') for key in self.CSV_EXTRA_FIELDS})
-                with open(path, 'w', newline='') as fh:
+                with open(path, 'w', newline='', encoding='utf-8') as fh:
                     writer = csv.DictWriter(fh, fieldnames=evaluate.CSV_FIELDS + self.CSV_EXTRA_FIELDS,
                                             extrasaction='ignore')
                     writer.writeheader()
